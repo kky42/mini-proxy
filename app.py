@@ -656,6 +656,21 @@ def pick_timeout(payload: dict[str, Any], provider: Provider) -> float:
     return router_state.default_timeout
 
 
+def build_upstream_timeout(
+    payload: dict[str, Any],
+    provider: Provider,
+    *,
+    stream: bool,
+) -> httpx.Timeout | float:
+    timeout = pick_timeout(payload, provider)
+    if not stream:
+        return timeout
+
+    # SSE responses can sit idle for a long time while the model reasons.
+    # Keep connect/write/pool bounded, but do not abort the stream for idle reads.
+    return httpx.Timeout(timeout, read=None)
+
+
 async def forward_request(request: Request, endpoint: str) -> Any:
     try:
         payload = await request.json()
@@ -683,7 +698,7 @@ async def forward_request(request: Request, endpoint: str) -> Any:
     streaming_response = False
     try:
         for provider in candidates:
-            timeout = pick_timeout(payload, provider)
+            timeout = build_upstream_timeout(payload, provider, stream=stream)
             upstream_payload = dict(payload)
             upstream_payload["model"] = provider.upstream_model
             url = f"{provider.api_base}{endpoint}"
@@ -738,7 +753,7 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                     {
                         "provider_id": provider.provider_id,
                         "api_base": provider.api_base,
-                        "timeout": timeout,
+                        "timeout": str(timeout),
                         "status": "transport_error",
                         "failure_class": decision.failure_class,
                         "counted": decision.count_failure,
@@ -777,7 +792,7 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                     {
                         "provider_id": provider.provider_id,
                         "api_base": provider.api_base,
-                        "timeout": timeout,
+                        "timeout": str(timeout),
                         "status": "http_error",
                         "http_status": response.status_code,
                         "failure_class": decision.failure_class,

@@ -118,6 +118,7 @@ model_list:
 - `port`: bind port for the local server. Default `8099`.
 - `log_level`: uvicorn log level. Default `info`.
 - `default_timeout`: request timeout in seconds when neither request body nor provider sets a timeout. Default `60`.
+  For streaming requests, this proxy keeps `connect`/`write`/`pool` bounded but disables the upstream `read` timeout so long-thinking SSE streams are not cut off mid-response.
 - `sticky_ttl_seconds`: optional session stickiness TTL in seconds. Default `1800`, so you do not need to set it unless you want to override it.
 - `normalize_upstream_model`: if `true`, `openai/gpt-5.4` becomes `gpt-5.4` before forwarding upstream. Default `true`.
 
@@ -160,6 +161,7 @@ model_list:
 - A provider enters cooldown only when its counted failure count becomes greater than `allowed_fails`.
 - After cooldown expires, new requests automatically go back to the higher-priority provider.
 - Request body `timeout` overrides provider timeout, which overrides `app_settings.default_timeout`.
+- For streaming requests, the selected timeout still applies to connect/write/pool, but upstream idle reads are left unbounded to avoid false reconnect loops.
 - Streaming fallback is only supported before the upstream stream starts.
 - Failures and cooldown state live in memory only.
 - For your current `jucode` setup, `responses` works with bare model names such as `gpt-5.4`. This proxy normalizes `openai/gpt-5.4` to `gpt-5.4` by default.
