@@ -598,6 +598,7 @@ async def stream_upstream(
     response: httpx.Response,
     provider: Provider,
     endpoint: str,
+    client: httpx.AsyncClient,
 ) -> AsyncIterator[bytes]:
     completed = False
     try:
@@ -622,6 +623,7 @@ async def stream_upstream(
             await router_state.record_success(provider, endpoint)
         if not response.is_closed:
             await response.aclose()
+        await client.aclose()
 
 
 def pick_timeout(payload: dict[str, Any], provider: Provider) -> float:
@@ -656,7 +658,9 @@ async def forward_request(request: Request, endpoint: str) -> Any:
     stream = bool(payload.get("stream"))
     attempts: list[dict[str, Any]] = []
 
-    async with httpx.AsyncClient(follow_redirects=True) as client:
+    client = httpx.AsyncClient(follow_redirects=True)
+    streaming_response = False
+    try:
         for provider in candidates:
             timeout = pick_timeout(payload, provider)
             upstream_payload = dict(payload)
@@ -670,14 +674,15 @@ async def forward_request(request: Request, endpoint: str) -> Any:
 
             try:
                 if stream:
-                    response = await client.send(
-                        client.build_request(
-                            "POST",
-                            url,
-                            headers=headers,
-                            json=upstream_payload,
-                        ),
+                    request = client.build_request(
+                        "POST",
+                        url,
+                        headers=headers,
+                        json=upstream_payload,
                         timeout=timeout,
+                    )
+                    response = await client.send(
+                        request,
                         stream=True,
                     )
                 else:
@@ -762,8 +767,9 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                     "x-fallback-api-base": provider.api_base,
                 }
                 content_type = response.headers.get("content-type", "text/event-stream")
+                streaming_response = True
                 return StreamingResponse(
-                    stream_upstream(response, provider, endpoint),
+                    stream_upstream(response, provider, endpoint, client),
                     status_code=response.status_code,
                     media_type=content_type,
                     headers=headers,
@@ -795,14 +801,17 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                 },
             )
 
-    raise HTTPException(
-        status_code=503,
-        detail={
-            "message": "All providers failed",
-            "model": model_name,
-            "attempts": attempts,
-        },
-    )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": "All providers failed",
+                "model": model_name,
+                "attempts": attempts,
+            },
+        )
+    finally:
+        if not streaming_response:
+            await client.aclose()
 
 
 @app.get("/healthz")
