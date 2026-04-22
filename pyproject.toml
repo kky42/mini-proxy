@@ -1,0 +1,14 @@
+[project]
+name = "mini-fallback-proxy"
+version = "0.1.0"
+description = "Small local fallback proxy with ordered failover and cooldown."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi==0.136.0",
+  "httpx==0.28.1",
+  "pyyaml==6.0.3",
+  "uvicorn==0.44.0",
+]
+
+[tool.uv]
+package = false
