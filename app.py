@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
 from dataclasses import dataclass
 from enum import Enum
+from datetime import datetime
+from urllib.parse import urlparse
 from typing import Any, AsyncIterator
 
 import httpx
@@ -592,6 +595,23 @@ if not CONFIG_PATH:
 
 router_state = RouterState(os.path.expanduser(CONFIG_PATH))
 app = FastAPI(title="Mini Fallback Proxy")
+logger = logging.getLogger("uvicorn.error")
+
+
+def log_provider_event(
+    event: str,
+    provider: Provider,
+    detail: str = "",
+) -> None:
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    provider_name = urlparse(provider.api_base).netloc or provider.api_base
+    message = (
+        f"{timestamp} provider={provider_name} "
+        f"model={provider.model_name} event={event}"
+    )
+    if detail:
+        message = f"{message} {detail}"
+    logger.info(message)
 
 
 async def stream_upstream(
@@ -621,6 +641,7 @@ async def stream_upstream(
     finally:
         if completed:
             await router_state.record_success(provider, endpoint)
+            log_provider_event("success", provider, f"endpoint={endpoint} stream=true")
         if not response.is_closed:
             await response.aclose()
         await client.aclose()
@@ -671,6 +692,11 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                 "Content-Type": "application/json",
                 **provider.extra_headers,
             }
+            log_provider_event(
+                "attempt",
+                provider,
+                f"endpoint={endpoint} stream={str(stream).lower()}",
+            )
 
             try:
                 if stream:
@@ -695,6 +721,11 @@ async def forward_request(request: Request, endpoint: str) -> Any:
             except Exception as exc:
                 error_message = f"{exc.__class__.__name__}: {exc}"
                 decision = classify_transport_error(exc)
+                log_provider_event(
+                    "failure",
+                    provider,
+                    f"endpoint={endpoint} error={error_message}",
+                )
                 await router_state.record_failure(
                     provider=provider,
                     endpoint=endpoint,
@@ -724,6 +755,11 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                     status_code=response.status_code,
                     body=body,
                     endpoint=endpoint,
+                )
+                log_provider_event(
+                    "failure",
+                    provider,
+                    f"endpoint={endpoint} status={response.status_code}",
                 )
                 error_message = (
                     f"HTTP {response.status_code}: "
@@ -778,6 +814,7 @@ async def forward_request(request: Request, endpoint: str) -> Any:
             body = await response.aread()
             await response.aclose()
             await router_state.record_success(provider, endpoint)
+            log_provider_event("success", provider, f"endpoint={endpoint} stream=false")
             await router_state.bind_session(sticky_key, provider)
 
             parsed: Any
