@@ -1,5 +1,7 @@
 # mini-fallback-proxy
 
+![mini-fallback-proxy logo](assets/logo/mini-fallback-proxy-logo-v1.png)
+
 A small local proxy with:
 
 - strict ordered fallback
