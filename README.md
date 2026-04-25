@@ -121,6 +121,10 @@ model_list:
   For streaming requests, this proxy keeps `connect`/`write`/`pool` bounded but disables the upstream `read` timeout so long-thinking SSE streams are not cut off mid-response.
 - `sticky_ttl_seconds`: optional session stickiness TTL in seconds. Default `1800`, so you do not need to set it unless you want to override it.
 - `normalize_upstream_model`: if `true`, `openai/gpt-5.4` becomes `gpt-5.4` before forwarding upstream. Default `true`.
+- `hot_reload`: if `true`, the proxy polls the config file and applies valid edits without restart. Default `true`.
+- `hot_reload_interval_seconds`: config file polling interval. Default `1`.
+
+`host`, `port`, and `log_level` are read by `start.sh` before uvicorn starts. Editing them is reflected in `/debug/state` after reload, but changing the actual listening socket or uvicorn log level still requires restarting the process.
 
 `router_settings`
 
@@ -164,6 +168,8 @@ model_list:
 - For streaming requests, the selected timeout still applies to connect/write/pool, but upstream idle reads are left unbounded to avoid false reconnect loops.
 - Streaming fallback is only supported before the upstream stream starts.
 - Failures and cooldown state live in memory only.
+- Config hot reload is enabled by default. Valid changes to routes, providers, timeouts, cooldown settings, stickiness TTL, and model normalization are applied automatically.
+- If a changed config is invalid, the proxy keeps serving with the last good config and records the error in `/debug/state`.
 - For your current `jucode` setup, `responses` works with bare model names such as `gpt-5.4`. This proxy normalizes `openai/gpt-5.4` to `gpt-5.4` by default.
 
 Built-in default failure policy:

@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from enum import Enum
 from datetime import datetime
@@ -21,6 +22,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 CONFIG_PATH = os.environ.get("MINI_FALLBACK_PROXY_CONFIG")
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_STICKY_TTL_SECONDS = 1800
+DEFAULT_HOT_RELOAD_INTERVAL_SECONDS = 1.0
 
 
 def _normalize_upstream_model(model_name: str) -> str:
@@ -35,6 +37,28 @@ def _coerce_optional_timeout(value: Any) -> float | None:
     if isinstance(value, (int, float)) and value > 0:
         return float(value)
     return None
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
+
+
+def _coerce_positive_float(value: Any, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
 
 
 def _coerce_headers(value: Any) -> dict[str, str]:
@@ -313,6 +337,28 @@ class Provider:
         return f"{self.model_name}|{self.order}|{self.api_base}|{self.upstream_model}"
 
 
+@dataclass(frozen=True)
+class RouterConfig:
+    host: str
+    port: int
+    log_level: str
+    default_timeout: float
+    sticky_ttl_seconds: int
+    normalize_upstream_model: bool
+    hot_reload: bool
+    hot_reload_interval_seconds: float
+    allowed_fails: int
+    cooldown_time: int
+    providers_by_model: dict[str, list[Provider]]
+
+
+@dataclass(frozen=True)
+class ReloadResult:
+    status: str
+    reloaded: bool
+    error: str | None = None
+
+
 def build_failure_key(provider: Provider, endpoint: str) -> str:
     return f"{provider.provider_id}|{endpoint}|{provider.model_name}"
 
@@ -337,36 +383,66 @@ class RouterState:
         self.port = 8099
         self.log_level = "info"
         self.normalize_upstream_model = True
+        self.hot_reload = True
+        self.hot_reload_interval_seconds = DEFAULT_HOT_RELOAD_INTERVAL_SECONDS
         self.providers_by_model: dict[str, list[Provider]] = {}
-        self.reload()
+        self.last_reload_at: float | None = None
+        self.last_config_mtime: float | None = None
+        self.last_observed_config_mtime: float | None = None
+        self.last_reload_error: str | None = None
+        self._apply_config(self._load_config())
 
-    def reload(self) -> None:
+    def _load_config(self) -> RouterConfig:
         with open(self.config_path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
+        if not isinstance(raw, dict):
+            raise ValueError("Config root must be a mapping")
 
-        app_settings = raw.get("app_settings") or {}
-        self.host = str(app_settings.get("host", "127.0.0.1"))
-        self.port = int(app_settings.get("port", 8099))
-        self.log_level = str(app_settings.get("log_level", "info"))
-        self.default_timeout = float(app_settings.get("default_timeout", DEFAULT_TIMEOUT))
-        self.sticky_ttl_seconds = int(
+        app_settings = raw.get("app_settings")
+        if app_settings is None:
+            app_settings = {}
+        if not isinstance(app_settings, dict):
+            raise ValueError("app_settings must be a mapping")
+
+        host = str(app_settings.get("host", "127.0.0.1"))
+        port = int(app_settings.get("port", 8099))
+        log_level = str(app_settings.get("log_level", "info"))
+        default_timeout = float(app_settings.get("default_timeout", DEFAULT_TIMEOUT))
+        sticky_ttl_seconds = int(
             app_settings.get("sticky_ttl_seconds", DEFAULT_STICKY_TTL_SECONDS)
         )
-        self.normalize_upstream_model = bool(
-            app_settings.get("normalize_upstream_model", True)
+        normalize_upstream_model = _coerce_bool(
+            app_settings.get("normalize_upstream_model"), True
+        )
+        hot_reload = _coerce_bool(app_settings.get("hot_reload"), True)
+        hot_reload_interval_seconds = _coerce_positive_float(
+            app_settings.get("hot_reload_interval_seconds"),
+            DEFAULT_HOT_RELOAD_INTERVAL_SECONDS,
         )
 
-        router_settings = raw.get("router_settings") or {}
-        self.allowed_fails = int(router_settings.get("allowed_fails", 0))
-        self.cooldown_time = int(router_settings.get("cooldown_time", 300))
+        router_settings = raw.get("router_settings")
+        if router_settings is None:
+            router_settings = {}
+        if not isinstance(router_settings, dict):
+            raise ValueError("router_settings must be a mapping")
+        allowed_fails = int(router_settings.get("allowed_fails", 0))
+        cooldown_time = int(router_settings.get("cooldown_time", 300))
 
         grouped: dict[str, list[Provider]] = {}
-        for item in raw.get("model_list", []):
-            model_name = item["model_name"]
+        model_list = raw.get("model_list", [])
+        if not isinstance(model_list, list):
+            raise ValueError("model_list must be a list")
+
+        for index, item in enumerate(model_list):
+            if not isinstance(item, dict):
+                raise ValueError(f"model_list[{index}] must be a mapping")
+            model_name = str(item["model_name"])
             params = item["litellm_params"]
+            if not isinstance(params, dict):
+                raise ValueError(f"model_list[{index}].litellm_params must be a mapping")
             configured_model = str(params["model"])
             upstream_model = configured_model
-            if self.normalize_upstream_model:
+            if normalize_upstream_model:
                 upstream_model = _normalize_upstream_model(configured_model)
             provider = Provider(
                 model_name=model_name,
@@ -380,10 +456,74 @@ class RouterState:
             )
             grouped.setdefault(model_name, []).append(provider)
 
-        self.providers_by_model = {
+        providers_by_model = {
             model: sorted(providers, key=lambda p: (p.order, p.api_base, p.upstream_model))
             for model, providers in grouped.items()
         }
+        return RouterConfig(
+            host=host,
+            port=port,
+            log_level=log_level,
+            default_timeout=default_timeout,
+            sticky_ttl_seconds=sticky_ttl_seconds,
+            normalize_upstream_model=normalize_upstream_model,
+            hot_reload=hot_reload,
+            hot_reload_interval_seconds=hot_reload_interval_seconds,
+            allowed_fails=allowed_fails,
+            cooldown_time=cooldown_time,
+            providers_by_model=providers_by_model,
+        )
+
+    def _apply_config(self, config: RouterConfig) -> None:
+        self.host = config.host
+        self.port = config.port
+        self.log_level = config.log_level
+        self.default_timeout = config.default_timeout
+        self.sticky_ttl_seconds = config.sticky_ttl_seconds
+        self.normalize_upstream_model = config.normalize_upstream_model
+        self.hot_reload = config.hot_reload
+        self.hot_reload_interval_seconds = config.hot_reload_interval_seconds
+        self.allowed_fails = config.allowed_fails
+        self.cooldown_time = config.cooldown_time
+        self.providers_by_model = config.providers_by_model
+        self.last_reload_at = time.time()
+        self.last_reload_error = None
+        try:
+            config_mtime = os.path.getmtime(self.config_path)
+        except OSError:
+            config_mtime = None
+        self.last_config_mtime = config_mtime
+        self.last_observed_config_mtime = config_mtime
+
+    async def reload(self) -> ReloadResult:
+        try:
+            config = self._load_config()
+        except Exception as exc:
+            error = f"{exc.__class__.__name__}: {exc}"
+            async with self._lock:
+                self.last_reload_error = error
+            return ReloadResult(status="rejected", reloaded=False, error=error)
+
+        async with self._lock:
+            self._apply_config(config)
+        return ReloadResult(status="reloaded", reloaded=True)
+
+    async def reload_if_changed(self) -> ReloadResult:
+        try:
+            current_mtime = os.path.getmtime(self.config_path)
+        except OSError as exc:
+            error = f"{exc.__class__.__name__}: {exc}"
+            async with self._lock:
+                self.last_reload_error = error
+            return ReloadResult(status="rejected", reloaded=False, error=error)
+
+        async with self._lock:
+            previous_mtime = self.last_observed_config_mtime
+        if previous_mtime is not None and current_mtime == previous_mtime:
+            return ReloadResult(status="unchanged", reloaded=False)
+        async with self._lock:
+            self.last_observed_config_mtime = current_mtime
+        return await self.reload()
 
     async def get_candidate_providers(
         self, model_name: str, endpoint: str, sticky_key: str | None
@@ -518,6 +658,21 @@ class RouterState:
                     "default_timeout": self.default_timeout,
                     "sticky_ttl_seconds": self.sticky_ttl_seconds,
                     "normalize_upstream_model": self.normalize_upstream_model,
+                    "hot_reload": self.hot_reload,
+                    "hot_reload_interval_seconds": self.hot_reload_interval_seconds,
+                },
+                "hot_reload": {
+                    "enabled": self.hot_reload,
+                    "interval_seconds": self.hot_reload_interval_seconds,
+                    "last_success_at": self.last_reload_at,
+                    "last_success_at_iso": datetime.fromtimestamp(
+                        self.last_reload_at
+                    ).isoformat()
+                    if self.last_reload_at
+                    else None,
+                    "last_config_mtime": self.last_config_mtime,
+                    "last_observed_config_mtime": self.last_observed_config_mtime,
+                    "last_error": self.last_reload_error,
                 },
                 "allowed_fails": self.allowed_fails,
                 "cooldown_time": self.cooldown_time,
@@ -594,8 +749,38 @@ if not CONFIG_PATH:
     )
 
 router_state = RouterState(os.path.expanduser(CONFIG_PATH))
-app = FastAPI(title="Mini Fallback Proxy")
 logger = logging.getLogger("uvicorn.error")
+
+
+async def watch_config_changes() -> None:
+    while True:
+        await asyncio.sleep(router_state.hot_reload_interval_seconds)
+        if not router_state.hot_reload:
+            continue
+
+        result = await router_state.reload_if_changed()
+        if result.status == "reloaded":
+            logger.info("Config hot-reloaded from %s", router_state.config_path)
+        elif result.status == "rejected":
+            logger.error(
+                "Config hot reload rejected for %s: %s",
+                router_state.config_path,
+                result.error,
+            )
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    task = asyncio.create_task(watch_config_changes())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+app = FastAPI(title="Mini Fallback Proxy", lifespan=lifespan)
 
 
 def log_provider_event(
@@ -903,8 +1088,11 @@ async def get_model(model_name: str) -> dict[str, Any]:
 
 @app.post("/admin/reload")
 async def reload_config() -> dict[str, Any]:
-    router_state.reload()
-    return {"status": "reloaded"}
+    result = await router_state.reload()
+    response: dict[str, Any] = {"status": result.status, "reloaded": result.reloaded}
+    if result.error:
+        response["error"] = result.error
+    return response
 
 
 @app.post("/v1/chat/completions")
