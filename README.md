@@ -174,7 +174,7 @@ model_list:
 
 Built-in default failure policy:
 
-- `401`, `403`, timeouts, transport errors, `408`, `429`, `5xx`: fallback and count toward cooldown
+- `401`, `402`, `403`, timeouts, transport errors, `408`, `429`, `5xx`: fallback and count toward cooldown
 - model/endpoint/parameter capability mismatch: fallback but do not count toward cooldown
 - request-invalid errors such as generic `400/422`, context issues, content policy: do not count; default is no fallback
 - mid-stream disconnects: count toward cooldown but do not transparently replay on another provider

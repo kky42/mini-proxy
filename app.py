@@ -215,7 +215,7 @@ def classify_http_error(status_code: int, body: bytes, endpoint: str) -> Failure
         payload, body[:500].decode("utf-8", errors="replace")
     ).lower()
 
-    if status_code in {401, 403}:
+    if status_code in {401, 402, 403}:
         return FailureDecision(
             failure_class=FailureClass.AUTH_OR_BALANCE,
             should_fallback=True,

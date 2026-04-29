@@ -104,6 +104,18 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "unchanged")
         self.assertFalse(result.reloaded)
 
+    async def test_payment_required_falls_back_and_counts_for_cooldown(self) -> None:
+        decision = app_module.classify_http_error(
+            402,
+            b'{"error":{"message":"Insufficient balance"}}',
+            "/responses",
+        )
+
+        self.assertEqual(decision.failure_class, app_module.FailureClass.AUTH_OR_BALANCE)
+        self.assertTrue(decision.should_fallback)
+        self.assertTrue(decision.count_failure)
+        self.assertEqual(decision.cooldown_multiplier, 3.0)
+
 
 if __name__ == "__main__":
     unittest.main()
