@@ -543,10 +543,14 @@ class RouterState:
                 else:
                     cooling.append(provider)
 
-            # If all providers are cooling down, still return in order so the caller
-            # gets a deterministic error chain instead of random selection.
-            candidates = healthy or cooling
-            return self._apply_sticky_preference(candidates, sticky_key)
+            # Prefer providers outside cooldown, but keep cooling providers as a
+            # last-resort chain for cases where the only healthy upstream fails.
+            if healthy:
+                return [
+                    *self._apply_sticky_preference(healthy, sticky_key),
+                    *cooling,
+                ]
+            return self._apply_sticky_preference(cooling, sticky_key)
 
     def _apply_sticky_preference(
         self, providers: list[Provider], sticky_key: str | None
@@ -878,6 +882,7 @@ async def forward_request(request: Request, endpoint: str) -> Any:
 
     stream = bool(payload.get("stream"))
     attempts: list[dict[str, Any]] = []
+    total_provider_count = len(candidates)
 
     client = httpx.AsyncClient(follow_redirects=True)
     streaming_response = False
@@ -1043,6 +1048,8 @@ async def forward_request(request: Request, endpoint: str) -> Any:
             detail={
                 "message": "All providers failed",
                 "model": model_name,
+                "candidate_provider_count": total_provider_count,
+                "attempted_provider_count": len(attempts),
                 "attempts": attempts,
             },
         )

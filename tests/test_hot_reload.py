@@ -11,7 +11,37 @@ from typing import Any
 import yaml
 
 
-def write_config(path: Path, *, api_base: str, order: int = 1) -> None:
+def write_config(
+    path: Path,
+    *,
+    api_base: str,
+    order: int = 1,
+    extra_providers: list[tuple[str, int]] | None = None,
+) -> None:
+    providers = [
+        {
+            "model_name": "gpt-test",
+            "litellm_params": {
+                "model": "openai/gpt-test",
+                "api_base": api_base,
+                "api_key": "sk-test",
+                "order": order,
+            },
+        }
+    ]
+    for extra_api_base, extra_order in extra_providers or []:
+        providers.append(
+            {
+                "model_name": "gpt-test",
+                "litellm_params": {
+                    "model": "openai/gpt-test",
+                    "api_base": extra_api_base,
+                    "api_key": "sk-test",
+                    "order": extra_order,
+                },
+            }
+        )
+
     data: dict[str, Any] = {
         "app_settings": {
             "hot_reload": True,
@@ -22,17 +52,7 @@ def write_config(path: Path, *, api_base: str, order: int = 1) -> None:
             "allowed_fails": 1,
             "cooldown_time": 300,
         },
-        "model_list": [
-            {
-                "model_name": "gpt-test",
-                "litellm_params": {
-                    "model": "openai/gpt-test",
-                    "api_base": api_base,
-                    "api_key": "sk-test",
-                    "order": order,
-                },
-            }
-        ],
+        "model_list": providers,
     }
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
 
@@ -115,6 +135,30 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(decision.should_fallback)
         self.assertTrue(decision.count_failure)
         self.assertEqual(decision.cooldown_multiplier, 3.0)
+
+    async def test_cooling_providers_are_kept_as_last_resort(self) -> None:
+        write_config(
+            self.config_path,
+            api_base="https://one.example/v1",
+            extra_providers=[("https://two.example/v1", 2)],
+        )
+        self.state = app_module.RouterState(str(self.config_path))
+        providers = self.state.providers_by_model["gpt-test"]
+        cooling_provider = providers[1]
+        self.state.cooldown_until[
+            app_module.build_failure_key(cooling_provider, "/responses")
+        ] = 9999999999
+
+        candidates = await self.state.get_candidate_providers(
+            "gpt-test",
+            "/responses",
+            sticky_key=None,
+        )
+
+        self.assertEqual([provider.api_base for provider in candidates], [
+            "https://one.example/v1",
+            "https://two.example/v1",
+        ])
 
 
 if __name__ == "__main__":
