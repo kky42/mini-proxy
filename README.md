@@ -31,7 +31,7 @@ chmod +x ./start.sh
 
 ## Config Example
 
-Example file: [config.example.yaml](/Users/kky/Desktop/mini-fallback-proxy/config.example.yaml)
+Example file: [config.example.yaml](/Users/kky/Desktop/mini-proxy/config.example.yaml)
 
 ```yaml
 app_settings:
@@ -49,6 +49,7 @@ providers:
   - name: jucode
     api_base: https://cf.jucode.top/v1
     api_key: sk-your-jucode-key
+    endpoint_type: responses
     order: 1
     models:
       - gpt-5.4
@@ -58,6 +59,7 @@ providers:
   - name: rightcode
     api_base: https://right.codes/codex/v1
     api_key: sk-your-rightcode-key
+    endpoint_type: responses
     order: 2
     models:
       - gpt-5.4
@@ -67,6 +69,7 @@ providers:
   - name: yescode
     api_base: https://co.yes.vg/v1
     api_key: sk-your-yescode-key
+    endpoint_type: responses
     order: 3
     models:
       - gpt-5.4
@@ -76,11 +79,19 @@ providers:
   - name: anthropic-compatible
     api_base: https://anthropic-compatible.example/v1
     api_key: sk-your-provider-key
+    endpoint_type: anthropic
     order: 4
     models:
       - deepseek-v4-flash:haiku
       - deepseek-v4-pro:opus
       - deepseek-v4-pro
+
+  - name: songsong-anthropic
+    api_base: https://ai.songsongcard.shop
+    api_key: sk-your-provider-key
+    endpoint_type: anthropic
+    order: 5
+    models: auto
 ```
 
 ## Supported Settings
@@ -110,10 +121,30 @@ providers:
 - `name`: optional provider label shown in debug/model output.
 - `api_base`: upstream base URL.
 - `api_key`: upstream API key.
+- `endpoint_type`: optional endpoint family. Values are `responses`, `openai-compatible`, or `anthropic`.
+  When set, the provider is only used for that local endpoint family.
 - `order`: provider priority. Lower number means higher priority.
 - `timeout`: optional provider-specific timeout in seconds.
 - `headers`: optional extra headers sent on every request to that upstream.
-- `models`: non-empty list of models this provider supports.
+- `models`: non-empty list of models this provider supports, or `auto`.
+- `models_url`: optional override for `models: auto` discovery.
+
+`models: auto`
+
+When `models` is set to `auto`, the proxy loads model ids from the provider's models endpoint when the config is loaded or hot-reloaded.
+
+```yaml
+providers:
+  - name: songsong-anthropic
+    api_base: https://ai.songsongcard.shop
+    api_key: sk-your-provider-key
+    endpoint_type: anthropic
+    models: auto
+```
+
+By default, discovery calls `{api_base}/models` when `api_base` already ends with `/v1`; otherwise it calls `{api_base}/v1/models`. Set `models_url` if a provider exposes model discovery somewhere else.
+
+For `endpoint_type: anthropic`, discovery uses Anthropic-style headers: `x-api-key` and `anthropic-version`. Other endpoint types use OpenAI-style bearer auth. If the provider's model response includes `supported_endpoint_types`, the proxy filters discovered models to the configured `endpoint_type`.
 
 `providers[*].models[*]`
 
@@ -125,6 +156,8 @@ models:
   - deepseek-v4-flash:haiku
   - deepseek-v4-pro:opus
 ```
+
+Role suffixes also match incoming Anthropic model ids by role substring. For example, `deepseek-v4-pro:opus` can serve requests for `claude-opus-4-7`, `claude-opus-4-7[1M]`, or a future Claude Code Opus id containing `opus`.
 
 - Exact Claude alias suffix form, for routing a known Claude Code model id:
 
@@ -164,7 +197,9 @@ models:
 ## Behavior Notes
 
 - For a requested model, the proxy tries only providers whose `models` list includes that model, ordered by lowest `order` first.
+- `endpoint_type` restricts a provider to one local route family: `responses` for `/v1/responses`, `openai-compatible` for `/v1/chat/completions`, and `anthropic` for `/v1/messages`.
 - For `/v1/messages`, `:haiku`, `:sonnet`, and `:opus` model suffixes expose Claude Code-safe aliases: `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, and `claude-opus-4-7`.
+- If Claude Code sends a newer role model id that contains `haiku`, `sonnet`, or `opus`, the proxy can still route it to providers configured with the matching role suffix.
 - Claude Code's `[1M]` suffix is accepted for routing, then stripped before matching. For example, `claude-opus-4-7[1M]` routes as `claude-opus-4-7`.
 - Anthropic role aliases are only local routing names. Upstream requests use the configured provider model, such as `deepseek-v4-pro`.
 - Session stickiness is enabled by default for 30 minutes.

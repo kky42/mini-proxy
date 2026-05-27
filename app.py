@@ -30,6 +30,7 @@ ANTHROPIC_ROLE_MODEL_ALIASES = {
     "opus": "claude-opus-4-7",
 }
 ANTHROPIC_ONE_M_SUFFIX_RE = re.compile(r"\[1m\]\s*$", re.IGNORECASE)
+ENDPOINT_TYPES = {"responses", "openai-compatible", "anthropic"}
 
 
 def _normalize_upstream_model(model_name: str) -> str:
@@ -45,6 +46,14 @@ def _strip_anthropic_context_marker(model_name: str) -> str:
 
 def _normalize_requested_model(model_name: str) -> str:
     return _strip_anthropic_context_marker(model_name)
+
+
+def _infer_anthropic_role_from_model_name(model_name: str) -> str | None:
+    normalized = _normalize_requested_model(model_name).lower()
+    for role in ANTHROPIC_ROLE_MODEL_ALIASES:
+        if role in normalized:
+            return role
+    return None
 
 
 def _coerce_anthropic_role(value: Any, *, context: str) -> str:
@@ -122,6 +131,39 @@ def _coerce_headers(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
     return {str(key): str(header_value) for key, header_value in value.items()}
+
+
+def _coerce_endpoint_type(value: Any, *, context: str) -> str | None:
+    if value is None:
+        return None
+    endpoint_type = str(value).strip().lower()
+    aliases = {
+        "openai": "openai-compatible",
+        "openai_compatible": "openai-compatible",
+        "chat": "openai-compatible",
+        "chat-completions": "openai-compatible",
+        "chat_completions": "openai-compatible",
+        "responses-api": "responses",
+        "response": "responses",
+        "messages": "anthropic",
+    }
+    endpoint_type = aliases.get(endpoint_type, endpoint_type)
+    if endpoint_type not in ENDPOINT_TYPES:
+        allowed = ", ".join(sorted(ENDPOINT_TYPES))
+        raise ValueError(f"{context} must be one of: {allowed}")
+    return endpoint_type
+
+
+def _endpoint_type_supports_endpoint(endpoint_type: str | None, endpoint: str) -> bool:
+    if endpoint_type is None:
+        return True
+    if endpoint_type == "anthropic":
+        return endpoint == "/messages"
+    if endpoint_type == "responses":
+        return endpoint == "/responses"
+    if endpoint_type == "openai-compatible":
+        return endpoint == "/chat/completions"
+    return False
 
 
 def _safe_json_loads(body: bytes) -> dict[str, Any] | None:
@@ -385,6 +427,7 @@ class Provider:
     configured_model: str
     upstream_model: str
     anthropic_role: str | None
+    endpoint_type: str | None
     api_base: str
     api_key: str
     order: int
@@ -458,6 +501,7 @@ class RouterState:
         model_name: str,
         configured_model: str,
         anthropic_role: str | None,
+        endpoint_type: str | None,
         provider_params: dict[str, Any],
         normalize_upstream_model: bool,
     ) -> Provider:
@@ -470,6 +514,7 @@ class RouterState:
             configured_model=configured_model,
             upstream_model=upstream_model,
             anthropic_role=anthropic_role,
+            endpoint_type=endpoint_type,
             api_base=str(provider_params["api_base"]).rstrip("/"),
             api_key=provider_params["api_key"],
             order=int(provider_params.get("order", 100)),
@@ -546,6 +591,78 @@ class RouterState:
             )
         return model_name, configured_model, anthropic_role
 
+    def _models_url(self, provider_params: dict[str, Any]) -> str:
+        configured_url = provider_params.get("models_url")
+        if configured_url is not None:
+            return str(configured_url)
+
+        api_base = str(provider_params["api_base"]).rstrip("/")
+        if api_base.endswith("/v1"):
+            return f"{api_base}/models"
+        return f"{api_base}/v1/models"
+
+    def _load_auto_models(
+        self,
+        provider_params: dict[str, Any],
+        *,
+        provider_index: int,
+        endpoint_type: str | None,
+    ) -> list[str]:
+        headers = {"Accept": "application/json"}
+        if endpoint_type == "anthropic":
+            headers["x-api-key"] = str(provider_params["api_key"])
+            headers["anthropic-version"] = ANTHROPIC_VERSION
+        else:
+            headers["Authorization"] = f"Bearer {provider_params['api_key']}"
+
+        response = httpx.get(
+            self._models_url(provider_params),
+            headers=headers,
+            timeout=_coerce_optional_timeout(provider_params.get("timeout")) or DEFAULT_TIMEOUT,
+        )
+        if response.status_code >= 400:
+            raise ValueError(
+                f"providers[{provider_index}].models auto discovery failed with "
+                f"HTTP {response.status_code}: {response.text[:500]}"
+            )
+
+        payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list):
+            raise ValueError(
+                f"providers[{provider_index}].models auto discovery response must include "
+                "a data list"
+            )
+
+        discovered: list[str] = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            model_id = item.get("id")
+            if not isinstance(model_id, str) or not model_id.strip():
+                continue
+
+            supported_types = item.get("supported_endpoint_types")
+            if endpoint_type and isinstance(supported_types, list):
+                normalized_supported_types = {
+                    _coerce_endpoint_type(
+                        supported_type,
+                        context=(
+                            f"providers[{provider_index}].models auto "
+                            "supported_endpoint_types"
+                        ),
+                    )
+                    for supported_type in supported_types
+                }
+                if endpoint_type not in normalized_supported_types:
+                    continue
+
+            discovered.append(model_id.strip())
+
+        if not discovered:
+            raise ValueError(f"providers[{provider_index}].models auto discovered no models")
+        return discovered
+
     def _load_providers(
         self,
         raw: dict[str, Any],
@@ -570,10 +687,20 @@ class RouterState:
                         f"providers[{provider_index}].{required_key} is required"
                     )
 
+            endpoint_type = _coerce_endpoint_type(
+                provider_params.get("endpoint_type"),
+                context=f"providers[{provider_index}].endpoint_type",
+            )
             models = provider_params.get("models")
+            if isinstance(models, str) and models.strip().lower() == "auto":
+                models = self._load_auto_models(
+                    provider_params,
+                    provider_index=provider_index,
+                    endpoint_type=endpoint_type,
+                )
             if not isinstance(models, list) or not models:
                 raise ValueError(
-                    f"providers[{provider_index}].models must be a non-empty list"
+                    f"providers[{provider_index}].models must be a non-empty list or 'auto'"
                 )
 
             provider_name_value = provider_params.get("name")
@@ -596,6 +723,7 @@ class RouterState:
                     model_name=model_name,
                     configured_model=configured_model,
                     anthropic_role=anthropic_role,
+                    endpoint_type=endpoint_type,
                     provider_params=provider_params,
                     normalize_upstream_model=normalize_upstream_model,
                 )
@@ -716,7 +844,26 @@ class RouterState:
     ) -> list[Provider]:
         model_name = _normalize_requested_model(model_name)
         async with self._lock:
-            providers = self.providers_by_model.get(model_name)
+            providers = list(self.providers_by_model.get(model_name, []))
+            if endpoint == "/messages":
+                role = _infer_anthropic_role_from_model_name(model_name)
+                if role:
+                    role_providers = [
+                        provider
+                        for model_providers in self.providers_by_model.values()
+                        for provider in model_providers
+                        if provider.anthropic_role == role
+                    ]
+                    seen_provider_ids = {provider.provider_id for provider in providers}
+                    providers.extend(
+                        provider
+                        for provider in role_providers
+                        if provider.provider_id not in seen_provider_ids
+                    )
+            providers = sorted(
+                providers,
+                key=lambda provider: (provider.order, provider.api_base, provider.upstream_model),
+            )
             if not providers:
                 raise KeyError(model_name)
 
@@ -724,11 +871,16 @@ class RouterState:
             healthy: list[Provider] = []
             cooling: list[Provider] = []
             for provider in providers:
+                if not _endpoint_type_supports_endpoint(provider.endpoint_type, endpoint):
+                    continue
                 cooldown_until = self.cooldown_until.get(build_failure_key(provider, endpoint), 0)
                 if cooldown_until <= now:
                     healthy.append(provider)
                 else:
                     cooling.append(provider)
+
+            if not healthy and not cooling:
+                raise KeyError(model_name)
 
             # Prefer providers outside cooldown, but keep cooling providers as a
             # last-resort chain for cases where the only healthy upstream fails.
@@ -826,6 +978,7 @@ class RouterState:
                             "upstream_model": provider.upstream_model,
                             "configured_model": provider.configured_model,
                             "anthropic_role": provider.anthropic_role,
+                            "endpoint_type": provider.endpoint_type,
                             "api_base": provider.api_base,
                             "order": provider.order,
                             "timeout": provider.timeout,
@@ -909,6 +1062,7 @@ class RouterState:
                                 "configured_model": provider.configured_model,
                                 "upstream_model": provider.upstream_model,
                                 "anthropic_role": provider.anthropic_role,
+                                "endpoint_type": provider.endpoint_type,
                             }
                             for provider in providers
                         ],
@@ -939,6 +1093,7 @@ class RouterState:
                         "configured_model": provider.configured_model,
                         "upstream_model": provider.upstream_model,
                         "anthropic_role": provider.anthropic_role,
+                        "endpoint_type": provider.endpoint_type,
                     }
                     for provider in providers
                 ],

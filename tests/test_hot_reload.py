@@ -214,6 +214,115 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gpt_b_candidates[0].upstream_model, "provider-gpt-b")
         self.assertEqual([model["id"] for model in models], ["gpt-a", "gpt-b", "gpt-c"])
 
+    async def test_auto_models_are_loaded_from_provider_models_endpoint(self) -> None:
+        data: dict[str, Any] = {
+            "providers": [
+                {
+                    "name": "auto",
+                    "api_base": "https://auto.example",
+                    "api_key": "sk-auto",
+                    "order": 1,
+                    "endpoint_type": "openai-compatible",
+                    "models": "auto",
+                }
+            ]
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        captured: list[dict[str, Any]] = []
+
+        def fake_get(url: str, **kwargs: Any) -> httpx.Response:
+            captured.append({"url": url, **kwargs})
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {"id": "gpt-auto-a", "object": "model"},
+                        {"id": "gpt-auto-b", "object": "model"},
+                    ],
+                },
+            )
+
+        original_get = app_module.httpx.get
+        app_module.httpx.get = fake_get
+        try:
+            self.state = app_module.RouterState(str(self.config_path))
+        finally:
+            app_module.httpx.get = original_get
+
+        models = await self.state.list_models()
+        candidates = await self.state.get_candidate_providers(
+            "gpt-auto-a",
+            "/chat/completions",
+            sticky_key=None,
+        )
+
+        self.assertEqual(captured[0]["url"], "https://auto.example/v1/models")
+        self.assertEqual(
+            captured[0]["headers"]["Authorization"],
+            "Bearer sk-auto",
+        )
+        self.assertEqual([model["id"] for model in models], ["gpt-auto-a", "gpt-auto-b"])
+        self.assertEqual(candidates[0].upstream_model, "gpt-auto-a")
+
+    async def test_auto_models_are_filtered_by_endpoint_type(self) -> None:
+        data: dict[str, Any] = {
+            "providers": [
+                {
+                    "name": "songsong",
+                    "api_base": "https://ai.songsongcard.shop",
+                    "api_key": "sk-provider",
+                    "order": 1,
+                    "endpoint_type": "anthropic",
+                    "models": "auto",
+                }
+            ]
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+        def fake_get(url: str, **kwargs: Any) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "claude-opus-4-7",
+                            "object": "model",
+                            "supported_endpoint_types": ["anthropic"],
+                        },
+                        {
+                            "id": "gpt-5.5",
+                            "object": "model",
+                            "supported_endpoint_types": ["openai"],
+                        },
+                    ],
+                },
+            )
+
+        original_get = app_module.httpx.get
+        app_module.httpx.get = fake_get
+        try:
+            self.state = app_module.RouterState(str(self.config_path))
+        finally:
+            app_module.httpx.get = original_get
+
+        models = await self.state.list_models()
+        message_candidates = await self.state.get_candidate_providers(
+            "claude-opus-4-7",
+            "/messages",
+            sticky_key=None,
+        )
+
+        self.assertEqual([model["id"] for model in models], ["claude-opus-4-7"])
+        self.assertEqual(message_candidates[0].upstream_model, "claude-opus-4-7")
+        with self.assertRaises(KeyError):
+            await self.state.get_candidate_providers(
+                "claude-opus-4-7",
+                "/chat/completions",
+                sticky_key=None,
+            )
+
     async def test_anthropic_role_suffix_maps_claude_alias_to_provider_model(self) -> None:
         data: dict[str, Any] = {
             "providers": [
@@ -281,6 +390,65 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(opus_candidates[0].anthropic_role, "opus")
         self.assertIn("claude-haiku-4-5-20251001", [model["id"] for model in models])
         self.assertIn("claude-opus-4-7", [model["id"] for model in models])
+
+    async def test_anthropic_role_suffix_matches_requested_model_by_role_name(self) -> None:
+        data: dict[str, Any] = {
+            "providers": [
+                {
+                    "name": "future-opus",
+                    "api_base": "https://future.example/v1",
+                    "api_key": "sk-future",
+                    "order": 1,
+                    "endpoint_type": "anthropic",
+                    "models": ["model-a:opus"],
+                }
+            ]
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        self.state = app_module.RouterState(str(self.config_path))
+
+        candidates = await self.state.get_candidate_providers(
+            "claude-opus-4-99",
+            "/messages",
+            sticky_key=None,
+        )
+
+        self.assertEqual(candidates[0].upstream_model, "model-a")
+
+    async def test_anthropic_exact_model_and_role_suffix_share_candidates(self) -> None:
+        data: dict[str, Any] = {
+            "providers": [
+                {
+                    "name": "exact",
+                    "api_base": "https://exact.example/v1",
+                    "api_key": "sk-exact",
+                    "order": 1,
+                    "endpoint_type": "anthropic",
+                    "models": ["claude-opus-4-7"],
+                },
+                {
+                    "name": "mapped",
+                    "api_base": "https://mapped.example/v1",
+                    "api_key": "sk-mapped",
+                    "order": 2,
+                    "endpoint_type": "anthropic",
+                    "models": ["model-a:opus"],
+                },
+            ]
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        self.state = app_module.RouterState(str(self.config_path))
+
+        candidates = await self.state.get_candidate_providers(
+            "claude-opus-4-7",
+            "/messages",
+            sticky_key=None,
+        )
+
+        self.assertEqual(
+            [candidate.upstream_model for candidate in candidates],
+            ["claude-opus-4-7", "model-a"],
+        )
 
     async def test_messages_endpoint_rewrites_alias_to_upstream_model(self) -> None:
         data: dict[str, Any] = {

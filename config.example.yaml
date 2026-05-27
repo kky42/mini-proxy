@@ -13,6 +13,7 @@ providers:
   - name: jucode
     api_base: https://cf.jucode.top/v1
     api_key: sk-your-jucode-key
+    endpoint_type: responses
     order: 1
     models:
       - gpt-5.4
@@ -22,6 +23,7 @@ providers:
   - name: rightcode
     api_base: https://right.codes/codex/v1
     api_key: sk-your-rightcode-key
+    endpoint_type: responses
     order: 2
     models:
       - gpt-5.4
@@ -31,6 +33,7 @@ providers:
   - name: yescode
     api_base: https://co.yes.vg/v1
     api_key: sk-your-yescode-key
+    endpoint_type: responses
     order: 3
     models:
       - gpt-5.4
@@ -40,11 +43,19 @@ providers:
   - name: anthropic-compatible
     api_base: https://anthropic-compatible.example/v1
     api_key: sk-your-provider-key
+    endpoint_type: anthropic
     order: 4
     models:
       - deepseek-v4-flash:haiku
       - deepseek-v4-pro:opus
       - deepseek-v4-pro
+
+  - name: songsong-anthropic
+    api_base: https://ai.songsongcard.shop
+    api_key: sk-your-provider-key
+    endpoint_type: anthropic
+    order: 5
+    models: auto
 
 general_settings:
   master_key: sk-123456
