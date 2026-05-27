@@ -37,5 +37,14 @@ providers:
       - gpt-5.4-mini
       - gpt-5.3-codex
 
+  - name: anthropic-compatible
+    api_base: https://anthropic-compatible.example/v1
+    api_key: sk-your-provider-key
+    order: 4
+    models:
+      - deepseek-v4-flash:haiku
+      - deepseek-v4-pro:opus
+      - deepseek-v4-pro
+
 general_settings:
   master_key: sk-123456

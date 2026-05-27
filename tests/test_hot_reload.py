@@ -8,7 +8,9 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+import httpx
 import yaml
+from fastapi.testclient import TestClient
 
 
 def write_config(
@@ -211,6 +213,131 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gpt_b_candidates[0].configured_model, "openai/provider-gpt-b")
         self.assertEqual(gpt_b_candidates[0].upstream_model, "provider-gpt-b")
         self.assertEqual([model["id"] for model in models], ["gpt-a", "gpt-b", "gpt-c"])
+
+    async def test_anthropic_role_suffix_maps_claude_alias_to_provider_model(self) -> None:
+        data: dict[str, Any] = {
+            "providers": [
+                {
+                    "name": "fast",
+                    "api_base": "https://fast.example/v1",
+                    "api_key": "sk-fast",
+                    "order": 1,
+                    "models": ["deepseek-v4-flash:haiku", "deepseek-v4-pro:opus"],
+                },
+                {
+                    "name": "backup",
+                    "api_base": "https://backup.example/v1",
+                    "api_key": "sk-backup",
+                    "order": 2,
+                    "models": [{"model": "kimi-k2", "anthropic_role": "opus"}],
+                },
+                {
+                    "name": "direct",
+                    "api_base": "https://direct.example/v1",
+                    "api_key": "sk-direct",
+                    "order": 3,
+                    "models": ["deepseek-v4-pro"],
+                },
+            ]
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        self.state = app_module.RouterState(str(self.config_path))
+
+        opus_candidates = await self.state.get_candidate_providers(
+            "claude-opus-4-7[1M]",
+            "/messages",
+            sticky_key=None,
+        )
+        direct_candidates = await self.state.get_candidate_providers(
+            "deepseek-v4-pro",
+            "/messages",
+            sticky_key=None,
+        )
+        models = await self.state.list_models()
+
+        self.assertEqual(
+            [provider.upstream_model for provider in opus_candidates],
+            ["deepseek-v4-pro", "kimi-k2"],
+        )
+        self.assertEqual([provider.upstream_model for provider in direct_candidates], [
+            "deepseek-v4-pro",
+        ])
+        self.assertEqual(opus_candidates[0].anthropic_role, "opus")
+        self.assertIn("claude-haiku-4-5", [model["id"] for model in models])
+        self.assertIn("claude-opus-4-7", [model["id"] for model in models])
+
+    async def test_messages_endpoint_rewrites_alias_to_upstream_model(self) -> None:
+        data: dict[str, Any] = {
+            "app_settings": {"hot_reload": False},
+            "providers": [
+                {
+                    "name": "anthropic-compatible",
+                    "api_base": "https://anthropic.example/v1",
+                    "api_key": "sk-anthropic",
+                    "order": 1,
+                    "models": ["deepseek-v4-pro:opus"],
+                }
+            ],
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        self.state = app_module.RouterState(str(self.config_path))
+
+        captured: list[dict[str, Any]] = []
+
+        class FakeAsyncClient:
+            def __init__(self, **_: Any) -> None:
+                pass
+
+            async def post(
+                self,
+                url: str,
+                *,
+                headers: dict[str, str],
+                json: dict[str, Any],
+                timeout: Any,
+            ) -> httpx.Response:
+                captured.append(
+                    {
+                        "url": url,
+                        "headers": headers,
+                        "json": json,
+                        "timeout": timeout,
+                    }
+                )
+                return httpx.Response(
+                    200,
+                    json={"id": "msg-test", "type": "message"},
+                    headers={"content-type": "application/json"},
+                )
+
+            async def aclose(self) -> None:
+                pass
+
+        original_state = app_module.router_state
+        original_client = app_module.httpx.AsyncClient
+        app_module.router_state = self.state
+        app_module.httpx.AsyncClient = FakeAsyncClient
+        try:
+            client = TestClient(app_module.app)
+            response = client.post(
+                "/v1/messages",
+                headers={"anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-opus-4-7[1M]",
+                    "max_tokens": 256,
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+        finally:
+            app_module.router_state = original_state
+            app_module.httpx.AsyncClient = original_client
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(captured[0]["url"], "https://anthropic.example/v1/messages")
+        self.assertEqual(captured[0]["json"]["model"], "deepseek-v4-pro")
+        self.assertEqual(captured[0]["headers"]["x-api-key"], "sk-anthropic")
+        self.assertEqual(captured[0]["headers"]["anthropic-version"], "2023-06-01")
+        self.assertNotIn("Authorization", captured[0]["headers"])
 
     async def test_legacy_model_list_is_rejected(self) -> None:
         self.config_path.write_text(

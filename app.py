@@ -23,12 +23,52 @@ CONFIG_PATH = os.environ.get("MINI_FALLBACK_PROXY_CONFIG")
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_STICKY_TTL_SECONDS = 1800
 DEFAULT_HOT_RELOAD_INTERVAL_SECONDS = 1.0
+ANTHROPIC_VERSION = "2023-06-01"
+ANTHROPIC_ROLE_MODEL_ALIASES = {
+    "haiku": "claude-haiku-4-5",
+    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-4-7",
+}
+ANTHROPIC_ONE_M_SUFFIX_RE = re.compile(r"\[1m\]\s*$", re.IGNORECASE)
 
 
 def _normalize_upstream_model(model_name: str) -> str:
     if "/" in model_name:
         return model_name.split("/", 1)[1]
     return model_name
+
+
+def _strip_anthropic_context_marker(model_name: str) -> str:
+    stripped = model_name.strip()
+    return ANTHROPIC_ONE_M_SUFFIX_RE.sub("", stripped).strip()
+
+
+def _normalize_requested_model(model_name: str) -> str:
+    return _strip_anthropic_context_marker(model_name)
+
+
+def _coerce_anthropic_role(value: Any, *, context: str) -> str:
+    role = str(value).strip().lower()
+    if role not in ANTHROPIC_ROLE_MODEL_ALIASES:
+        allowed = ", ".join(sorted(ANTHROPIC_ROLE_MODEL_ALIASES))
+        raise ValueError(f"{context} must be one of: {allowed}")
+    return role
+
+
+def _split_model_role_suffix(model_name: str) -> tuple[str, str | None]:
+    stripped = model_name.strip()
+    if ":" not in stripped:
+        return stripped, None
+
+    base, suffix = stripped.rsplit(":", 1)
+    role = suffix.strip().lower()
+    if role not in ANTHROPIC_ROLE_MODEL_ALIASES:
+        return stripped, None
+
+    base = base.strip()
+    if not base:
+        return stripped, None
+    return base, role
 
 
 def _coerce_optional_timeout(value: Any) -> float | None:
@@ -327,6 +367,7 @@ class Provider:
     model_name: str
     configured_model: str
     upstream_model: str
+    anthropic_role: str | None
     api_base: str
     api_key: str
     order: int
@@ -399,6 +440,7 @@ class RouterState:
         provider_name: str | None,
         model_name: str,
         configured_model: str,
+        anthropic_role: str | None,
         provider_params: dict[str, Any],
         normalize_upstream_model: bool,
     ) -> Provider:
@@ -410,6 +452,7 @@ class RouterState:
             model_name=model_name,
             configured_model=configured_model,
             upstream_model=upstream_model,
+            anthropic_role=anthropic_role,
             api_base=str(provider_params["api_base"]).rstrip("/"),
             api_key=provider_params["api_key"],
             order=int(provider_params.get("order", 100)),
@@ -423,14 +466,19 @@ class RouterState:
         *,
         provider_index: int,
         model_index: int,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, str | None]:
         if isinstance(model_entry, str):
-            model_name = model_entry.strip()
-            if not model_name:
+            configured_model, anthropic_role = _split_model_role_suffix(model_entry)
+            if not configured_model:
                 raise ValueError(
                     f"providers[{provider_index}].models[{model_index}] must not be empty"
                 )
-            return model_name, model_name
+            model_name = (
+                ANTHROPIC_ROLE_MODEL_ALIASES[anthropic_role]
+                if anthropic_role
+                else configured_model
+            )
+            return model_name, configured_model, anthropic_role
 
         if not isinstance(model_entry, dict):
             raise ValueError(
@@ -439,6 +487,18 @@ class RouterState:
 
         configured_model = model_entry.get("model", model_entry.get("upstream_model"))
         model_name = model_entry.get("model_name", model_entry.get("name"))
+        role_value = model_entry.get(
+            "anthropic_role",
+            model_entry.get("role", model_entry.get("map_to", model_entry.get("maps_to"))),
+        )
+        anthropic_role = (
+            _coerce_anthropic_role(
+                role_value,
+                context=f"providers[{provider_index}].models[{model_index}].anthropic_role",
+            )
+            if role_value is not None
+            else None
+        )
         if configured_model is None and model_name is None:
             raise ValueError(
                 f"providers[{provider_index}].models[{model_index}] must include "
@@ -449,13 +509,19 @@ class RouterState:
         if model_name is None:
             model_name = configured_model
 
+        configured_model, inferred_role = _split_model_role_suffix(str(configured_model))
+        if inferred_role and anthropic_role is None:
+            anthropic_role = inferred_role
+        if anthropic_role and "model_name" not in model_entry and "name" not in model_entry:
+            model_name = ANTHROPIC_ROLE_MODEL_ALIASES[anthropic_role]
+
         model_name = str(model_name).strip()
-        configured_model = str(configured_model).strip()
+        configured_model = configured_model.strip()
         if not model_name or not configured_model:
             raise ValueError(
                 f"providers[{provider_index}].models[{model_index}] has an empty model value"
             )
-        return model_name, configured_model
+        return model_name, configured_model, anthropic_role
 
     def _load_providers(
         self,
@@ -497,7 +563,7 @@ class RouterState:
                 provider_name = None
 
             for model_index, model_entry in enumerate(models):
-                model_name, configured_model = self._coerce_model_entry(
+                model_name, configured_model, anthropic_role = self._coerce_model_entry(
                     model_entry,
                     provider_index=provider_index,
                     model_index=model_index,
@@ -506,6 +572,7 @@ class RouterState:
                     provider_name=provider_name,
                     model_name=model_name,
                     configured_model=configured_model,
+                    anthropic_role=anthropic_role,
                     provider_params=provider_params,
                     normalize_upstream_model=normalize_upstream_model,
                 )
@@ -624,6 +691,7 @@ class RouterState:
     async def get_candidate_providers(
         self, model_name: str, endpoint: str, sticky_key: str | None
     ) -> list[Provider]:
+        model_name = _normalize_requested_model(model_name)
         async with self._lock:
             providers = self.providers_by_model.get(model_name)
             if not providers:
@@ -723,8 +791,10 @@ class RouterState:
                     provider_id = provider.provider_id
                     responses_key = build_failure_key(provider, "/responses")
                     chat_key = build_failure_key(provider, "/chat/completions")
+                    messages_key = build_failure_key(provider, "/messages")
                     responses_cooldown = self.cooldown_until.get(responses_key)
                     chat_cooldown = self.cooldown_until.get(chat_key)
+                    messages_cooldown = self.cooldown_until.get(messages_key)
                     providers.append(
                         {
                             "model_name": model_name,
@@ -732,6 +802,7 @@ class RouterState:
                             "provider_id": provider_id,
                             "upstream_model": provider.upstream_model,
                             "configured_model": provider.configured_model,
+                            "anthropic_role": provider.anthropic_role,
                             "api_base": provider.api_base,
                             "order": provider.order,
                             "timeout": provider.timeout,
@@ -743,10 +814,14 @@ class RouterState:
                                 "/chat/completions": max(0, int(chat_cooldown - now))
                                 if chat_cooldown
                                 else 0,
+                                "/messages": max(0, int(messages_cooldown - now))
+                                if messages_cooldown
+                                else 0,
                             },
                             "last_error": {
                                 "/responses": self.last_error.get(responses_key),
                                 "/chat/completions": self.last_error.get(chat_key),
+                                "/messages": self.last_error.get(messages_key),
                             },
                         }
                     )
@@ -810,6 +885,7 @@ class RouterState:
                                 "api_base": provider.api_base,
                                 "configured_model": provider.configured_model,
                                 "upstream_model": provider.upstream_model,
+                                "anthropic_role": provider.anthropic_role,
                             }
                             for provider in providers
                         ],
@@ -839,6 +915,7 @@ class RouterState:
                         "api_base": provider.api_base,
                         "configured_model": provider.configured_model,
                         "upstream_model": provider.upstream_model,
+                        "anthropic_role": provider.anthropic_role,
                     }
                     for provider in providers
                 ],
@@ -959,15 +1036,38 @@ def build_upstream_timeout(
     return httpx.Timeout(timeout, read=None)
 
 
+def build_upstream_headers(request: Request, provider: Provider, endpoint: str) -> dict[str, str]:
+    if endpoint == "/messages":
+        headers = {
+            "x-api-key": provider.api_key,
+            "anthropic-version": request.headers.get(
+                "anthropic-version",
+                ANTHROPIC_VERSION,
+            ),
+            "Content-Type": "application/json",
+        }
+        anthropic_beta = request.headers.get("anthropic-beta")
+        if anthropic_beta:
+            headers["anthropic-beta"] = anthropic_beta
+        return {**headers, **provider.extra_headers}
+
+    return {
+        "Authorization": f"Bearer {provider.api_key}",
+        "Content-Type": "application/json",
+        **provider.extra_headers,
+    }
+
+
 async def forward_request(request: Request, endpoint: str) -> Any:
     try:
         payload = await request.json()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Invalid JSON body: {exc}") from exc
 
-    model_name = payload.get("model")
-    if not model_name:
-        raise HTTPException(status_code=400, detail="Request body must include 'model'")
+    requested_model = payload.get("model")
+    if not isinstance(requested_model, str) or not requested_model.strip():
+        raise HTTPException(status_code=400, detail="Request body must include string 'model'")
+    model_name = _normalize_requested_model(requested_model)
 
     session_key = _extract_session_key(request, payload)
     sticky_key = (
@@ -991,11 +1091,7 @@ async def forward_request(request: Request, endpoint: str) -> Any:
             upstream_payload = dict(payload)
             upstream_payload["model"] = provider.upstream_model
             url = f"{provider.api_base}{endpoint}"
-            headers = {
-                "Authorization": f"Bearer {provider.api_key}",
-                "Content-Type": "application/json",
-                **provider.extra_headers,
-            }
+            headers = build_upstream_headers(request, provider, endpoint)
             log_provider_event(
                 "attempt",
                 provider,
@@ -1004,7 +1100,7 @@ async def forward_request(request: Request, endpoint: str) -> Any:
 
             try:
                 if stream:
-                    request = client.build_request(
+                    upstream_request = client.build_request(
                         "POST",
                         url,
                         headers=headers,
@@ -1012,7 +1108,7 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                         timeout=timeout,
                     )
                     response = await client.send(
-                        request,
+                        upstream_request,
                         stream=True,
                     )
                 else:
@@ -1167,7 +1263,13 @@ async def root() -> dict[str, Any]:
     return {
         "name": "mini-fallback-proxy",
         "config_path": router_state.config_path,
-        "endpoints": ["/v1/responses", "/v1/chat/completions", "/healthz", "/debug/state"],
+        "endpoints": [
+            "/v1/messages",
+            "/v1/responses",
+            "/v1/chat/completions",
+            "/healthz",
+            "/debug/state",
+        ],
     }
 
 
@@ -1209,3 +1311,8 @@ async def chat_completions(request: Request) -> Any:
 @app.post("/v1/responses")
 async def responses_api(request: Request) -> Any:
     return await forward_request(request, "/responses")
+
+
+@app.post("/v1/messages")
+async def messages_api(request: Request) -> Any:
+    return await forward_request(request, "/messages")

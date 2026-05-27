@@ -8,6 +8,7 @@ A small local proxy with:
 - in-memory cooldown after failure
 - automatic return to higher-priority providers after cooldown expires
 - OpenAI-compatible `responses` and `chat.completions` endpoints
+- Anthropic-compatible `messages` endpoint for Claude Code style clients
 
 It is designed to be a thin local layer, not a full gateway.
 
@@ -71,6 +72,15 @@ providers:
       - gpt-5.4
       - gpt-5.4-mini
       - gpt-5.3-codex
+
+  - name: anthropic-compatible
+    api_base: https://anthropic-compatible.example/v1
+    api_key: sk-your-provider-key
+    order: 4
+    models:
+      - deepseek-v4-flash:haiku
+      - deepseek-v4-pro:opus
+      - deepseek-v4-pro
 ```
 
 ## Supported Settings
@@ -108,15 +118,26 @@ providers:
 `providers[*].models[*]`
 
 - String form, for same local and upstream model name: `gpt-5.4`.
+- Anthropic role suffix form, for Claude Code role aliases:
+
+```yaml
+models:
+  - deepseek-v4-flash:haiku
+  - deepseek-v4-pro:opus
+```
+
 - Mapping form, for aliases or provider-specific upstream names:
 
 ```yaml
 models:
   - model_name: gpt-5.4
     model: openai/gpt-5.4
+  - model: kimi-k2
+    anthropic_role: opus
 ```
 
 `model_name` is the alias exposed by this local proxy. `model` is the upstream model value sent to that provider.
+`anthropic_role` can be `haiku`, `sonnet`, or `opus`; it exposes the corresponding Claude-looking alias for `/v1/messages` while forwarding the real provider model upstream.
 
 `general_settings`
 
@@ -126,6 +147,7 @@ models:
 
 - `POST /v1/responses`
 - `POST /v1/chat/completions`
+- `POST /v1/messages`
 - `GET /v1/models`
 - `GET /`
 - `GET /healthz`
@@ -135,6 +157,9 @@ models:
 ## Behavior Notes
 
 - For a requested model, the proxy tries only providers whose `models` list includes that model, ordered by lowest `order` first.
+- For `/v1/messages`, `:haiku`, `:sonnet`, and `:opus` model suffixes expose Claude Code-safe aliases: `claude-haiku-4-5`, `claude-sonnet-4-6`, and `claude-opus-4-7`.
+- Claude Code's `[1M]` suffix is accepted for routing, then stripped before matching. For example, `claude-opus-4-7[1M]` routes as `claude-opus-4-7`.
+- Anthropic role aliases are only local routing names. Upstream requests use the configured provider model, such as `deepseek-v4-pro`.
 - Session stickiness is enabled by default for 30 minutes.
 - Session key extraction order is: `x-fallback-session` header, then request body `conversation_id`, `thread_id`, `previous_response_id`, `user`, then the same keys under `metadata`.
 - Stickiness is applied per `session + endpoint + model alias`.
