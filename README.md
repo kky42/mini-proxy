@@ -159,12 +159,15 @@ models:
 
 Role suffixes also match incoming Anthropic model ids by role substring. For example, `deepseek-v4-pro:opus` can serve requests for `claude-opus-4-7`, `claude-opus-4-7[1M]`, or a future Claude Code Opus id containing `opus`.
 
-- Exact Claude alias suffix form, for routing a known Claude Code model id:
+- Generic alias suffix form, for exposing one local model id while forwarding another upstream model:
 
 ```yaml
 models:
+  - gpt-5.4-mini:gpt-5.5
   - deepseek-v4-flash:claude-haiku-4-5-20251001
 ```
+
+The value before `:` is sent upstream. The value after `:` is exposed by this proxy in `/v1/models` and used for local routing. If the upstream model id itself contains `:`, use the mapping object form instead.
 
 - Mapping form, for aliases or provider-specific upstream names:
 
@@ -188,7 +191,11 @@ models:
 - `POST /v1/responses`
 - `POST /v1/chat/completions`
 - `POST /v1/messages`
+- `POST /responses`
+- `POST /chat/completions`
+- `POST /messages`
 - `GET /v1/models`
+- `GET /models`
 - `GET /`
 - `GET /healthz`
 - `GET /debug/state`
@@ -198,6 +205,9 @@ models:
 
 - For a requested model, the proxy tries only providers whose `models` list includes that model, ordered by lowest `order` first.
 - `endpoint_type` restricts a provider to one local route family: `responses` for `/v1/responses`, `openai-compatible` for `/v1/chat/completions`, and `anthropic` for `/v1/messages`.
+- Local OpenAI-style clients may use either `http://127.0.0.1:PORT/v1` or `http://127.0.0.1:PORT` as the base URL. Claude Code should use `http://127.0.0.1:PORT` as `ANTHROPIC_BASE_URL`.
+- Upstream OpenAI-style provider bases may be configured with or without `/v1`; the proxy adds `/v1` for `/responses` and `/chat/completions` when needed.
+- Upstream Anthropic provider bases should be the provider's documented Anthropic base, such as `https://api.deepseek.com/anthropic`; the proxy appends `/messages`.
 - For `/v1/messages`, `:haiku`, `:sonnet`, and `:opus` model suffixes expose Claude Code-safe aliases: `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, and `claude-opus-4-7`.
 - If Claude Code sends a newer role model id that contains `haiku`, `sonnet`, or `opus`, the proxy can still route it to providers configured with the matching role suffix.
 - Claude Code's `[1M]` suffix is accepted for routing, then stripped before matching. For example, `claude-opus-4-7[1M]` routes as `claude-opus-4-7`.

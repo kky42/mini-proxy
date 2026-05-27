@@ -214,6 +214,41 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gpt_b_candidates[0].upstream_model, "provider-gpt-b")
         self.assertEqual([model["id"] for model in models], ["gpt-a", "gpt-b", "gpt-c"])
 
+    async def test_string_mapping_suffix_exposes_alias_and_forwards_upstream_model(
+        self,
+    ) -> None:
+        data: dict[str, Any] = {
+            "providers": [
+                {
+                    "name": "responses",
+                    "api_base": "https://responses.example",
+                    "api_key": "sk-responses",
+                    "order": 1,
+                    "endpoint_type": "responses",
+                    "models": ["gpt-5.4-mini:gpt-5.5"],
+                }
+            ]
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        self.state = app_module.RouterState(str(self.config_path))
+
+        candidates = await self.state.get_candidate_providers(
+            "gpt-5.5",
+            "/responses",
+            sticky_key=None,
+        )
+        models = await self.state.list_models()
+
+        self.assertEqual([model["id"] for model in models], ["gpt-5.5"])
+        self.assertEqual(candidates[0].configured_model, "gpt-5.4-mini")
+        self.assertEqual(candidates[0].upstream_model, "gpt-5.4-mini")
+        with self.assertRaises(KeyError):
+            await self.state.get_candidate_providers(
+                "gpt-5.4-mini",
+                "/responses",
+                sticky_key=None,
+            )
+
     async def test_auto_models_are_loaded_from_provider_models_endpoint(self) -> None:
         data: dict[str, Any] = {
             "providers": [
@@ -415,6 +450,79 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(candidates[0].upstream_model, "model-a")
 
+    async def test_upstream_openai_style_urls_add_v1_when_provider_base_omits_it(
+        self,
+    ) -> None:
+        responses_provider = app_module.Provider(
+            provider_name="responses",
+            model_name="gpt-5.5",
+            configured_model="gpt-5.5",
+            upstream_model="gpt-5.5",
+            anthropic_role=None,
+            endpoint_type="responses",
+            api_base="https://responses.example",
+            api_key="sk-responses",
+            order=1,
+            timeout=None,
+            extra_headers={},
+        )
+        chat_provider = app_module.Provider(
+            provider_name="chat",
+            model_name="deepseek-v4-flash",
+            configured_model="deepseek-v4-flash",
+            upstream_model="deepseek-v4-flash",
+            anthropic_role=None,
+            endpoint_type="openai-compatible",
+            api_base="https://chat.example",
+            api_key="sk-chat",
+            order=1,
+            timeout=None,
+            extra_headers={},
+        )
+        anthropic_provider = app_module.Provider(
+            provider_name="anthropic",
+            model_name="claude-opus-4-7",
+            configured_model="deepseek-v4-pro",
+            upstream_model="deepseek-v4-pro",
+            anthropic_role="opus",
+            endpoint_type="anthropic",
+            api_base="https://anthropic.example/anthropic",
+            api_key="sk-anthropic",
+            order=1,
+            timeout=None,
+            extra_headers={},
+        )
+        anthropic_host_provider = app_module.Provider(
+            provider_name="anthropic-host",
+            model_name="claude-opus-4-7",
+            configured_model="deepseek-v4-pro",
+            upstream_model="deepseek-v4-pro",
+            anthropic_role="opus",
+            endpoint_type="anthropic",
+            api_base="https://anthropic-host.example",
+            api_key="sk-anthropic",
+            order=1,
+            timeout=None,
+            extra_headers={},
+        )
+
+        self.assertEqual(
+            app_module.build_upstream_url(responses_provider, "/responses"),
+            "https://responses.example/v1/responses",
+        )
+        self.assertEqual(
+            app_module.build_upstream_url(chat_provider, "/chat/completions"),
+            "https://chat.example/v1/chat/completions",
+        )
+        self.assertEqual(
+            app_module.build_upstream_url(anthropic_provider, "/messages"),
+            "https://anthropic.example/anthropic/messages",
+        )
+        self.assertEqual(
+            app_module.build_upstream_url(anthropic_host_provider, "/messages"),
+            "https://anthropic-host.example/v1/messages",
+        )
+
     async def test_anthropic_exact_model_and_role_suffix_share_candidates(self) -> None:
         data: dict[str, Any] = {
             "providers": [
@@ -522,6 +630,116 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[0]["headers"]["x-api-key"], "sk-anthropic")
         self.assertEqual(captured[0]["headers"]["anthropic-version"], "2023-06-01")
         self.assertNotIn("Authorization", captured[0]["headers"])
+
+    async def test_invalid_success_response_falls_back_to_next_provider(self) -> None:
+        data: dict[str, Any] = {
+            "app_settings": {"hot_reload": False},
+            "providers": [
+                {
+                    "name": "bad-html",
+                    "api_base": "https://bad.example",
+                    "api_key": "sk-bad",
+                    "order": 1,
+                    "endpoint_type": "anthropic",
+                    "models": ["bad-model:opus"],
+                },
+                {
+                    "name": "good-json",
+                    "api_base": "https://good.example/v1",
+                    "api_key": "sk-good",
+                    "order": 2,
+                    "endpoint_type": "anthropic",
+                    "models": ["good-model:opus"],
+                },
+            ],
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        self.state = app_module.RouterState(str(self.config_path))
+
+        captured: list[dict[str, Any]] = []
+
+        class FakeAsyncClient:
+            def __init__(self, **_: Any) -> None:
+                pass
+
+            async def post(
+                self,
+                url: str,
+                *,
+                headers: dict[str, str],
+                json: dict[str, Any],
+                timeout: Any,
+            ) -> httpx.Response:
+                captured.append({"url": url, "json": json})
+                if "bad.example" in url:
+                    return httpx.Response(
+                        200,
+                        text="<!doctype html><title>Gateway</title>",
+                        headers={"content-type": "text/html; charset=utf-8"},
+                    )
+                return httpx.Response(
+                    200,
+                    json={"id": "msg-good", "type": "message"},
+                    headers={"content-type": "application/json"},
+                )
+
+            async def aclose(self) -> None:
+                pass
+
+        original_state = app_module.router_state
+        original_client = app_module.httpx.AsyncClient
+        app_module.router_state = self.state
+        app_module.httpx.AsyncClient = FakeAsyncClient
+        try:
+            client = TestClient(app_module.app)
+            response = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-opus-4-7",
+                    "max_tokens": 32,
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+        finally:
+            app_module.router_state = original_state
+            app_module.httpx.AsyncClient = original_client
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["id"], "msg-good")
+        self.assertEqual(
+            [attempt["json"]["model"] for attempt in captured],
+            ["bad-model", "good-model"],
+        )
+
+    async def test_root_models_endpoint_matches_v1_models_endpoint(self) -> None:
+        data: dict[str, Any] = {
+            "app_settings": {"hot_reload": False},
+            "providers": [
+                {
+                    "name": "responses",
+                    "api_base": "https://responses.example",
+                    "api_key": "sk-responses",
+                    "order": 1,
+                    "endpoint_type": "responses",
+                    "models": ["gpt-5.4-mini:gpt-5.5"],
+                }
+            ],
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        self.state = app_module.RouterState(str(self.config_path))
+
+        original_state = app_module.router_state
+        app_module.router_state = self.state
+        try:
+            client = TestClient(app_module.app)
+            root_response = client.get("/models")
+            v1_response = client.get("/v1/models")
+        finally:
+            app_module.router_state = original_state
+
+        self.assertEqual(root_response.status_code, 200)
+        self.assertEqual(root_response.json(), v1_response.json())
+        self.assertEqual(root_response.json()["data"][0]["id"], "gpt-5.5")
 
     async def test_legacy_model_list_is_rejected(self) -> None:
         self.config_path.write_text(

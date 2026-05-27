@@ -92,7 +92,7 @@ def _split_model_mapping_suffix(model_name: str) -> tuple[str, str | None, str |
     base, suffix = stripped.rsplit(":", 1)
     base = base.strip()
     alias = _normalize_requested_model(suffix)
-    if base and alias.startswith("claude-"):
+    if base and alias:
         return base, alias, None
     return stripped, None, None
 
@@ -1236,6 +1236,48 @@ def build_upstream_headers(request: Request, provider: Provider, endpoint: str) 
     }
 
 
+def build_upstream_url(provider: Provider, endpoint: str) -> str:
+    api_base = provider.api_base.rstrip("/")
+    parsed_base = urlparse(api_base)
+    base_path = parsed_base.path.rstrip("/")
+    if endpoint in {"/responses", "/chat/completions"} and not api_base.endswith("/v1"):
+        api_base = f"{api_base}/v1"
+    elif endpoint == "/messages" and not base_path:
+        api_base = f"{api_base}/v1"
+    return f"{api_base}{endpoint}"
+
+
+def is_valid_stream_success_content_type(content_type: str) -> bool:
+    return "text/event-stream" in content_type.lower()
+
+
+def parse_upstream_success_body(
+    body: bytes,
+    *,
+    content_type: str,
+    endpoint: str,
+) -> tuple[Any | None, str | None]:
+    normalized_content_type = content_type.lower()
+    stripped = body.lstrip()
+    if (
+        "application/json" in normalized_content_type
+        or stripped.startswith(b"{")
+        or stripped.startswith(b"[")
+    ):
+        try:
+            return json.loads(body), None
+        except Exception as exc:
+            return None, f"Invalid JSON success response: {exc}"
+
+    if endpoint == "/responses" and "text/event-stream" in normalized_content_type:
+        parsed = _extract_responses_json_from_sse(body)
+        if parsed is not None:
+            return parsed, None
+        return None, "Invalid Responses SSE success response"
+
+    return None, f"Unexpected success content-type: {content_type or '<missing>'}"
+
+
 async def forward_request(request: Request, endpoint: str) -> Any:
     try:
         payload = await request.json()
@@ -1268,7 +1310,7 @@ async def forward_request(request: Request, endpoint: str) -> Any:
             timeout = build_upstream_timeout(payload, provider, stream=stream)
             upstream_payload = dict(payload)
             upstream_payload["model"] = provider.upstream_model
-            url = f"{provider.api_base}{endpoint}"
+            url = build_upstream_url(provider, endpoint)
             headers = build_upstream_headers(request, provider, endpoint)
             log_provider_event(
                 "attempt",
@@ -1375,12 +1417,52 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                 return JSONResponse(content=parsed_detail, status_code=response.status_code)
 
             if stream:
+                content_type = response.headers.get("content-type", "")
+                if not is_valid_stream_success_content_type(content_type):
+                    body = await response.aread()
+                    await response.aclose()
+                    decision = FailureDecision(
+                        failure_class=FailureClass.CAPABILITY_MISMATCH,
+                        should_fallback=True,
+                        count_failure=False,
+                    )
+                    error_message = (
+                        f"Unexpected stream content-type: "
+                        f"{content_type or '<missing>'}: "
+                        f"{body[:500].decode('utf-8', errors='replace')}"
+                    )
+                    log_provider_event(
+                        "failure",
+                        provider,
+                        f"endpoint={endpoint} error=Unexpected stream content-type: "
+                        f"{content_type or '<missing>'}",
+                    )
+                    await router_state.record_failure(
+                        provider=provider,
+                        endpoint=endpoint,
+                        error_message=error_message,
+                        decision=decision,
+                    )
+                    attempts.append(
+                        {
+                            "provider_id": provider.provider_id,
+                            "api_base": provider.api_base,
+                            "timeout": str(timeout),
+                            "status": "invalid_stream_response",
+                            "failure_class": decision.failure_class,
+                            "counted": decision.count_failure,
+                            "should_fallback": decision.should_fallback,
+                            "content_type": content_type,
+                            "body_preview": body[:500].decode("utf-8", errors="replace"),
+                        }
+                    )
+                    continue
+
                 await router_state.bind_session(sticky_key, provider)
                 headers = {
                     "x-fallback-provider-id": provider.provider_id,
                     "x-fallback-api-base": provider.api_base,
                 }
-                content_type = response.headers.get("content-type", "text/event-stream")
                 streaming_response = True
                 return StreamingResponse(
                     stream_upstream(response, provider, endpoint, client),
@@ -1391,20 +1473,50 @@ async def forward_request(request: Request, endpoint: str) -> Any:
 
             body = await response.aread()
             await response.aclose()
+            content_type = response.headers.get("content-type", "")
+            parsed, parse_error = parse_upstream_success_body(
+                body,
+                content_type=content_type,
+                endpoint=endpoint,
+            )
+            if parse_error is not None:
+                decision = FailureDecision(
+                    failure_class=FailureClass.CAPABILITY_MISMATCH,
+                    should_fallback=True,
+                    count_failure=False,
+                )
+                error_message = (
+                    f"{parse_error}: {body[:500].decode('utf-8', errors='replace')}"
+                )
+                log_provider_event(
+                    "failure",
+                    provider,
+                    f"endpoint={endpoint} error={parse_error}",
+                )
+                await router_state.record_failure(
+                    provider=provider,
+                    endpoint=endpoint,
+                    error_message=error_message,
+                    decision=decision,
+                )
+                attempts.append(
+                    {
+                        "provider_id": provider.provider_id,
+                        "api_base": provider.api_base,
+                        "timeout": str(timeout),
+                        "status": "invalid_success_response",
+                        "failure_class": decision.failure_class,
+                        "counted": decision.count_failure,
+                        "should_fallback": decision.should_fallback,
+                        "content_type": content_type,
+                        "body_preview": body[:500].decode("utf-8", errors="replace"),
+                    }
+                )
+                continue
+
             await router_state.record_success(provider, endpoint)
             log_provider_event("success", provider, f"endpoint={endpoint} stream=false")
             await router_state.bind_session(sticky_key, provider)
-
-            parsed: Any
-            content_type = response.headers.get("content-type", "")
-            if "application/json" in content_type:
-                parsed = json.loads(body)
-            elif endpoint == "/responses" and "text/event-stream" in content_type:
-                parsed = _extract_responses_json_from_sse(body)
-                if parsed is None:
-                    parsed = {"raw_text": body.decode("utf-8", errors="replace")}
-            else:
-                parsed = {"raw_text": body.decode("utf-8", errors="replace")}
 
             return JSONResponse(
                 content=parsed,
@@ -1486,11 +1598,36 @@ async def chat_completions(request: Request) -> Any:
     return await forward_request(request, "/chat/completions")
 
 
+@app.post("/chat/completions")
+async def chat_completions_root(request: Request) -> Any:
+    return await forward_request(request, "/chat/completions")
+
+
 @app.post("/v1/responses")
 async def responses_api(request: Request) -> Any:
+    return await forward_request(request, "/responses")
+
+
+@app.post("/responses")
+async def responses_api_root(request: Request) -> Any:
     return await forward_request(request, "/responses")
 
 
 @app.post("/v1/messages")
 async def messages_api(request: Request) -> Any:
     return await forward_request(request, "/messages")
+
+
+@app.post("/messages")
+async def messages_api_root(request: Request) -> Any:
+    return await forward_request(request, "/messages")
+
+
+@app.get("/models")
+async def list_models_root() -> dict[str, Any]:
+    return await list_models()
+
+
+@app.get("/models/{model_name}")
+async def get_model_root(model_name: str) -> dict[str, Any]:
+    return await get_model(model_name)
