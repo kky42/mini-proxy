@@ -44,69 +44,33 @@ router_settings:
   allowed_fails: 1
   cooldown_time: 300
 
-model_list:
-  - model_name: gpt-5.4
-    litellm_params:
-      model: openai/gpt-5.4
-      api_base: https://cf.jucode.top/v1
-      api_key: sk-your-jucode-key
-      order: 1
+providers:
+  - name: jucode
+    api_base: https://cf.jucode.top/v1
+    api_key: sk-your-jucode-key
+    order: 1
+    models:
+      - gpt-5.4
+      - gpt-5.4-mini
+      - gpt-5.3-codex
 
-  - model_name: gpt-5.4
-    litellm_params:
-      model: openai/gpt-5.4
-      api_base: https://right.codes/codex/v1
-      api_key: sk-your-rightcode-key
-      order: 2
+  - name: rightcode
+    api_base: https://right.codes/codex/v1
+    api_key: sk-your-rightcode-key
+    order: 2
+    models:
+      - gpt-5.4
+      - gpt-5.4-mini
+      - gpt-5.3-codex
 
-  - model_name: gpt-5.4
-    litellm_params:
-      model: openai/gpt-5.4
-      api_base: https://co.yes.vg/v1
-      api_key: sk-your-yescode-key
-      order: 3
-
-  - model_name: gpt-5.4-mini
-    litellm_params:
-      model: openai/gpt-5.4-mini
-      api_base: https://cf.jucode.top/v1
-      api_key: sk-your-jucode-key
-      order: 1
-
-  - model_name: gpt-5.4-mini
-    litellm_params:
-      model: openai/gpt-5.4-mini
-      api_base: https://right.codes/codex/v1
-      api_key: sk-your-rightcode-key
-      order: 2
-
-  - model_name: gpt-5.4-mini
-    litellm_params:
-      model: openai/gpt-5.4-mini
-      api_base: https://co.yes.vg/v1
-      api_key: sk-your-yescode-key
-      order: 3
-
-  - model_name: gpt-5.3-codex
-    litellm_params:
-      model: openai/gpt-5.3-codex
-      api_base: https://cf.jucode.top/v1
-      api_key: sk-your-jucode-key
-      order: 1
-
-  - model_name: gpt-5.3-codex
-    litellm_params:
-      model: openai/gpt-5.3-codex
-      api_base: https://right.codes/codex/v1
-      api_key: sk-your-rightcode-key
-      order: 2
-
-  - model_name: gpt-5.3-codex
-    litellm_params:
-      model: openai/gpt-5.3-codex
-      api_base: https://co.yes.vg/v1
-      api_key: sk-your-yescode-key
-      order: 3
+  - name: yescode
+    api_base: https://co.yes.vg/v1
+    api_key: sk-your-yescode-key
+    order: 3
+    models:
+      - gpt-5.4
+      - gpt-5.4-mini
+      - gpt-5.3-codex
 ```
 
 ## Supported Settings
@@ -131,15 +95,28 @@ model_list:
 - `allowed_fails`: allowed failures before cooldown. Cooldown starts only when `fail_count > allowed_fails`. Default `0`.
 - `cooldown_time`: cooldown length in seconds. Default `300`.
 
-`model_list[*]`
+`providers[*]`
 
-- `model_name`: alias exposed by this local proxy.
-- `litellm_params.model`: configured model value from your LiteLLM-style config.
-- `litellm_params.api_base`: upstream base URL.
-- `litellm_params.api_key`: upstream API key.
-- `litellm_params.order`: lower number means higher priority.
-- `litellm_params.timeout`: optional provider-specific timeout in seconds.
-- `litellm_params.headers`: optional extra headers sent on every request to that upstream.
+- `name`: optional provider label shown in debug/model output.
+- `api_base`: upstream base URL.
+- `api_key`: upstream API key.
+- `order`: provider priority. Lower number means higher priority.
+- `timeout`: optional provider-specific timeout in seconds.
+- `headers`: optional extra headers sent on every request to that upstream.
+- `models`: non-empty list of models this provider supports.
+
+`providers[*].models[*]`
+
+- String form, for same local and upstream model name: `gpt-5.4`.
+- Mapping form, for aliases or provider-specific upstream names:
+
+```yaml
+models:
+  - model_name: gpt-5.4
+    model: openai/gpt-5.4
+```
+
+`model_name` is the alias exposed by this local proxy. `model` is the upstream model value sent to that provider.
 
 `general_settings`
 
@@ -157,7 +134,7 @@ model_list:
 
 ## Behavior Notes
 
-- The proxy always tries the lowest `order` first.
+- For a requested model, the proxy tries only providers whose `models` list includes that model, ordered by lowest `order` first.
 - Session stickiness is enabled by default for 30 minutes.
 - Session key extraction order is: `x-fallback-session` header, then request body `conversation_id`, `thread_id`, `previous_response_id`, `user`, then the same keys under `metadata`.
 - Stickiness is applied per `session + endpoint + model alias`.

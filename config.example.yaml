@@ -9,69 +9,33 @@ router_settings:
   allowed_fails: 1
   cooldown_time: 300
 
-model_list:
-  - model_name: gpt-5.4
-    litellm_params:
-      model: openai/gpt-5.4
-      api_base: https://cf.jucode.top/v1
-      api_key: sk-your-jucode-key
-      order: 1
+providers:
+  - name: jucode
+    api_base: https://cf.jucode.top/v1
+    api_key: sk-your-jucode-key
+    order: 1
+    models:
+      - gpt-5.4
+      - gpt-5.4-mini
+      - gpt-5.3-codex
 
-  - model_name: gpt-5.4
-    litellm_params:
-      model: openai/gpt-5.4
-      api_base: https://right.codes/codex/v1
-      api_key: sk-your-rightcode-key
-      order: 2
+  - name: rightcode
+    api_base: https://right.codes/codex/v1
+    api_key: sk-your-rightcode-key
+    order: 2
+    models:
+      - gpt-5.4
+      - gpt-5.4-mini
+      - gpt-5.3-codex
 
-  - model_name: gpt-5.4
-    litellm_params:
-      model: openai/gpt-5.4
-      api_base: https://co.yes.vg/v1
-      api_key: sk-your-yescode-key
-      order: 3
-
-  - model_name: gpt-5.4-mini
-    litellm_params:
-      model: openai/gpt-5.4-mini
-      api_base: https://cf.jucode.top/v1
-      api_key: sk-your-jucode-key
-      order: 1
-
-  - model_name: gpt-5.4-mini
-    litellm_params:
-      model: openai/gpt-5.4-mini
-      api_base: https://right.codes/codex/v1
-      api_key: sk-your-rightcode-key
-      order: 2
-
-  - model_name: gpt-5.4-mini
-    litellm_params:
-      model: openai/gpt-5.4-mini
-      api_base: https://co.yes.vg/v1
-      api_key: sk-your-yescode-key
-      order: 3
-
-  - model_name: gpt-5.3-codex
-    litellm_params:
-      model: openai/gpt-5.3-codex
-      api_base: https://cf.jucode.top/v1
-      api_key: sk-your-jucode-key
-      order: 1
-
-  - model_name: gpt-5.3-codex
-    litellm_params:
-      model: openai/gpt-5.3-codex
-      api_base: https://right.codes/codex/v1
-      api_key: sk-your-rightcode-key
-      order: 2
-
-  - model_name: gpt-5.3-codex
-    litellm_params:
-      model: openai/gpt-5.3-codex
-      api_base: https://co.yes.vg/v1
-      api_key: sk-your-yescode-key
-      order: 3
+  - name: yescode
+    api_base: https://co.yes.vg/v1
+    api_key: sk-your-yescode-key
+    order: 3
+    models:
+      - gpt-5.4
+      - gpt-5.4-mini
+      - gpt-5.3-codex
 
 general_settings:
   master_key: sk-123456

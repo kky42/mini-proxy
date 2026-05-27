@@ -20,25 +20,21 @@ def write_config(
 ) -> None:
     providers = [
         {
-            "model_name": "gpt-test",
-            "litellm_params": {
-                "model": "openai/gpt-test",
-                "api_base": api_base,
-                "api_key": "sk-test",
-                "order": order,
-            },
+            "name": "primary",
+            "api_base": api_base,
+            "api_key": "sk-test",
+            "order": order,
+            "models": ["gpt-test"],
         }
     ]
-    for extra_api_base, extra_order in extra_providers or []:
+    for index, (extra_api_base, extra_order) in enumerate(extra_providers or [], start=2):
         providers.append(
             {
-                "model_name": "gpt-test",
-                "litellm_params": {
-                    "model": "openai/gpt-test",
-                    "api_base": extra_api_base,
-                    "api_key": "sk-test",
-                    "order": extra_order,
-                },
+                "name": f"provider-{index}",
+                "api_base": extra_api_base,
+                "api_key": "sk-test",
+                "order": extra_order,
+                "models": ["gpt-test"],
             }
         )
 
@@ -52,7 +48,7 @@ def write_config(
             "allowed_fails": 1,
             "cooldown_time": 300,
         },
-        "model_list": providers,
+        "providers": providers,
     }
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
 
@@ -94,7 +90,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_invalid_hot_reload_keeps_last_good_config(self) -> None:
         previous_mtime = os.path.getmtime(self.config_path)
-        self.config_path.write_text("model_list: not-a-list\n", encoding="utf-8")
+        self.config_path.write_text("providers: not-a-list\n", encoding="utf-8")
         touch_newer(self.config_path, previous_mtime)
 
         result = await self.state.reload_if_changed()
@@ -104,7 +100,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "rejected")
         self.assertFalse(result.reloaded)
         self.assertEqual(models[0]["providers"][0]["api_base"], "https://one.example/v1")
-        self.assertIn("model_list must be a list", snapshot["hot_reload"]["last_error"])
+        self.assertIn("providers must be a list", snapshot["hot_reload"]["last_error"])
 
     async def test_manual_reload_rejects_invalid_config(self) -> None:
         self.config_path.write_text("app_settings: []\n", encoding="utf-8")
@@ -159,6 +155,84 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             "https://one.example/v1",
             "https://two.example/v1",
         ])
+
+    async def test_provider_level_models_expand_to_model_routes(self) -> None:
+        data: dict[str, Any] = {
+            "providers": [
+                {
+                    "name": "first",
+                    "api_base": "https://first.example/v1",
+                    "api_key": "sk-first",
+                    "order": 1,
+                    "models": [
+                        "gpt-a",
+                        {"model_name": "gpt-b", "model": "openai/provider-gpt-b"},
+                    ],
+                },
+                {
+                    "name": "second",
+                    "api_base": "https://second.example/v1",
+                    "api_key": "sk-second",
+                    "order": 2,
+                    "models": ["gpt-a"],
+                },
+                {
+                    "name": "third",
+                    "api_base": "https://third.example/v1",
+                    "api_key": "sk-third",
+                    "order": 3,
+                    "models": ["gpt-c"],
+                },
+            ]
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        self.state = app_module.RouterState(str(self.config_path))
+
+        gpt_a_candidates = await self.state.get_candidate_providers(
+            "gpt-a",
+            "/responses",
+            sticky_key=None,
+        )
+        gpt_b_candidates = await self.state.get_candidate_providers(
+            "gpt-b",
+            "/responses",
+            sticky_key=None,
+        )
+        models = await self.state.list_models()
+
+        self.assertEqual(
+            [provider.api_base for provider in gpt_a_candidates],
+            ["https://first.example/v1", "https://second.example/v1"],
+        )
+        self.assertEqual(
+            [provider.api_base for provider in gpt_b_candidates],
+            ["https://first.example/v1"],
+        )
+        self.assertEqual(gpt_b_candidates[0].configured_model, "openai/provider-gpt-b")
+        self.assertEqual(gpt_b_candidates[0].upstream_model, "provider-gpt-b")
+        self.assertEqual([model["id"] for model in models], ["gpt-a", "gpt-b", "gpt-c"])
+
+    async def test_legacy_model_list_is_rejected(self) -> None:
+        self.config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "model_list": [
+                        {
+                            "model_name": "gpt-test",
+                            "litellm_params": {
+                                "model": "openai/gpt-test",
+                                "api_base": "https://old.example/v1",
+                                "api_key": "sk-test",
+                            },
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "model_list is no longer supported"):
+            app_module.RouterState(str(self.config_path))
 
 
 if __name__ == "__main__":

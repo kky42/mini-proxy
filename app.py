@@ -323,6 +323,7 @@ class StickyBinding:
 
 @dataclass(frozen=True)
 class Provider:
+    provider_name: str | None
     model_name: str
     configured_model: str
     upstream_model: str
@@ -392,6 +393,129 @@ class RouterState:
         self.last_reload_error: str | None = None
         self._apply_config(self._load_config())
 
+    def _build_provider(
+        self,
+        *,
+        provider_name: str | None,
+        model_name: str,
+        configured_model: str,
+        provider_params: dict[str, Any],
+        normalize_upstream_model: bool,
+    ) -> Provider:
+        upstream_model = configured_model
+        if normalize_upstream_model:
+            upstream_model = _normalize_upstream_model(configured_model)
+        return Provider(
+            provider_name=provider_name,
+            model_name=model_name,
+            configured_model=configured_model,
+            upstream_model=upstream_model,
+            api_base=str(provider_params["api_base"]).rstrip("/"),
+            api_key=provider_params["api_key"],
+            order=int(provider_params.get("order", 100)),
+            timeout=_coerce_optional_timeout(provider_params.get("timeout")),
+            extra_headers=_coerce_headers(provider_params.get("headers")),
+        )
+
+    def _coerce_model_entry(
+        self,
+        model_entry: Any,
+        *,
+        provider_index: int,
+        model_index: int,
+    ) -> tuple[str, str]:
+        if isinstance(model_entry, str):
+            model_name = model_entry.strip()
+            if not model_name:
+                raise ValueError(
+                    f"providers[{provider_index}].models[{model_index}] must not be empty"
+                )
+            return model_name, model_name
+
+        if not isinstance(model_entry, dict):
+            raise ValueError(
+                f"providers[{provider_index}].models[{model_index}] must be a string or mapping"
+            )
+
+        configured_model = model_entry.get("model", model_entry.get("upstream_model"))
+        model_name = model_entry.get("model_name", model_entry.get("name"))
+        if configured_model is None and model_name is None:
+            raise ValueError(
+                f"providers[{provider_index}].models[{model_index}] must include "
+                "'model_name' or 'model'"
+            )
+        if configured_model is None:
+            configured_model = model_name
+        if model_name is None:
+            model_name = configured_model
+
+        model_name = str(model_name).strip()
+        configured_model = str(configured_model).strip()
+        if not model_name or not configured_model:
+            raise ValueError(
+                f"providers[{provider_index}].models[{model_index}] has an empty model value"
+            )
+        return model_name, configured_model
+
+    def _load_providers(
+        self,
+        raw: dict[str, Any],
+        *,
+        normalize_upstream_model: bool,
+    ) -> dict[str, list[Provider]]:
+        if "model_list" in raw:
+            raise ValueError("model_list is no longer supported; use providers[*].models")
+
+        providers_config = raw.get("providers")
+        if not isinstance(providers_config, list):
+            raise ValueError("providers must be a list")
+
+        grouped: dict[str, list[Provider]] = {}
+        for provider_index, provider_params in enumerate(providers_config):
+            if not isinstance(provider_params, dict):
+                raise ValueError(f"providers[{provider_index}] must be a mapping")
+
+            for required_key in ("api_base", "api_key"):
+                if required_key not in provider_params:
+                    raise ValueError(
+                        f"providers[{provider_index}].{required_key} is required"
+                    )
+
+            models = provider_params.get("models")
+            if not isinstance(models, list) or not models:
+                raise ValueError(
+                    f"providers[{provider_index}].models must be a non-empty list"
+                )
+
+            provider_name_value = provider_params.get("name")
+            provider_name = (
+                str(provider_name_value).strip()
+                if provider_name_value is not None
+                else None
+            )
+            if provider_name == "":
+                provider_name = None
+
+            for model_index, model_entry in enumerate(models):
+                model_name, configured_model = self._coerce_model_entry(
+                    model_entry,
+                    provider_index=provider_index,
+                    model_index=model_index,
+                )
+                provider = self._build_provider(
+                    provider_name=provider_name,
+                    model_name=model_name,
+                    configured_model=configured_model,
+                    provider_params=provider_params,
+                    normalize_upstream_model=normalize_upstream_model,
+                )
+                grouped.setdefault(model_name, []).append(provider)
+
+        return {
+            model: sorted(providers, key=lambda p: (p.order, p.api_base, p.upstream_model))
+            for model, providers in grouped.items()
+        }
+
     def _load_config(self) -> RouterConfig:
         with open(self.config_path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
@@ -428,38 +552,10 @@ class RouterState:
         allowed_fails = int(router_settings.get("allowed_fails", 0))
         cooldown_time = int(router_settings.get("cooldown_time", 300))
 
-        grouped: dict[str, list[Provider]] = {}
-        model_list = raw.get("model_list", [])
-        if not isinstance(model_list, list):
-            raise ValueError("model_list must be a list")
-
-        for index, item in enumerate(model_list):
-            if not isinstance(item, dict):
-                raise ValueError(f"model_list[{index}] must be a mapping")
-            model_name = str(item["model_name"])
-            params = item["litellm_params"]
-            if not isinstance(params, dict):
-                raise ValueError(f"model_list[{index}].litellm_params must be a mapping")
-            configured_model = str(params["model"])
-            upstream_model = configured_model
-            if normalize_upstream_model:
-                upstream_model = _normalize_upstream_model(configured_model)
-            provider = Provider(
-                model_name=model_name,
-                configured_model=configured_model,
-                upstream_model=upstream_model,
-                api_base=str(params["api_base"]).rstrip("/"),
-                api_key=params["api_key"],
-                order=int(params.get("order", 100)),
-                timeout=_coerce_optional_timeout(params.get("timeout")),
-                extra_headers=_coerce_headers(params.get("headers")),
-            )
-            grouped.setdefault(model_name, []).append(provider)
-
-        providers_by_model = {
-            model: sorted(providers, key=lambda p: (p.order, p.api_base, p.upstream_model))
-            for model, providers in grouped.items()
-        }
+        providers_by_model = self._load_providers(
+            raw,
+            normalize_upstream_model=normalize_upstream_model,
+        )
         return RouterConfig(
             host=host,
             port=port,
@@ -632,6 +728,7 @@ class RouterState:
                     providers.append(
                         {
                             "model_name": model_name,
+                            "provider_name": provider.provider_name,
                             "provider_id": provider_id,
                             "upstream_model": provider.upstream_model,
                             "configured_model": provider.configured_model,
@@ -708,6 +805,7 @@ class RouterState:
                         "parent": None,
                         "providers": [
                             {
+                                "provider_name": provider.provider_name,
                                 "order": provider.order,
                                 "api_base": provider.api_base,
                                 "configured_model": provider.configured_model,
@@ -736,6 +834,7 @@ class RouterState:
                 "parent": None,
                 "providers": [
                     {
+                        "provider_name": provider.provider_name,
                         "order": provider.order,
                         "api_base": provider.api_base,
                         "configured_model": provider.configured_model,
