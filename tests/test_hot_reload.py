@@ -238,6 +238,13 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
                     "order": 3,
                     "models": ["deepseek-v4-pro"],
                 },
+                {
+                    "name": "exact-haiku",
+                    "api_base": "https://exact.example/v1",
+                    "api_key": "sk-exact",
+                    "order": 4,
+                    "models": ["qwen-haiku:claude-haiku-4-5-20251001[1M]"],
+                },
             ]
         }
         self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
@@ -245,6 +252,11 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
 
         opus_candidates = await self.state.get_candidate_providers(
             "claude-opus-4-7[1M]",
+            "/messages",
+            sticky_key=None,
+        )
+        haiku_candidates = await self.state.get_candidate_providers(
+            "claude-haiku-4-5-20251001",
             "/messages",
             sticky_key=None,
         )
@@ -259,11 +271,15 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             [provider.upstream_model for provider in opus_candidates],
             ["deepseek-v4-pro", "kimi-k2"],
         )
+        self.assertEqual(
+            [provider.upstream_model for provider in haiku_candidates],
+            ["deepseek-v4-flash", "qwen-haiku"],
+        )
         self.assertEqual([provider.upstream_model for provider in direct_candidates], [
             "deepseek-v4-pro",
         ])
         self.assertEqual(opus_candidates[0].anthropic_role, "opus")
-        self.assertIn("claude-haiku-4-5", [model["id"] for model in models])
+        self.assertIn("claude-haiku-4-5-20251001", [model["id"] for model in models])
         self.assertIn("claude-opus-4-7", [model["id"] for model in models])
 
     async def test_messages_endpoint_rewrites_alias_to_upstream_model(self) -> None:

@@ -25,7 +25,7 @@ DEFAULT_STICKY_TTL_SECONDS = 1800
 DEFAULT_HOT_RELOAD_INTERVAL_SECONDS = 1.0
 ANTHROPIC_VERSION = "2023-06-01"
 ANTHROPIC_ROLE_MODEL_ALIASES = {
-    "haiku": "claude-haiku-4-5",
+    "haiku": "claude-haiku-4-5-20251001",
     "sonnet": "claude-sonnet-4-6",
     "opus": "claude-opus-4-7",
 }
@@ -69,6 +69,23 @@ def _split_model_role_suffix(model_name: str) -> tuple[str, str | None]:
     if not base:
         return stripped, None
     return base, role
+
+
+def _split_model_mapping_suffix(model_name: str) -> tuple[str, str | None, str | None]:
+    configured_model, role = _split_model_role_suffix(model_name)
+    if role:
+        return configured_model, ANTHROPIC_ROLE_MODEL_ALIASES[role], role
+
+    stripped = model_name.strip()
+    if ":" not in stripped:
+        return stripped, None, None
+
+    base, suffix = stripped.rsplit(":", 1)
+    base = base.strip()
+    alias = _normalize_requested_model(suffix)
+    if base and alias.startswith("claude-"):
+        return base, alias, None
+    return stripped, None, None
 
 
 def _coerce_optional_timeout(value: Any) -> float | None:
@@ -468,16 +485,14 @@ class RouterState:
         model_index: int,
     ) -> tuple[str, str, str | None]:
         if isinstance(model_entry, str):
-            configured_model, anthropic_role = _split_model_role_suffix(model_entry)
+            configured_model, alias_model_name, anthropic_role = _split_model_mapping_suffix(
+                model_entry
+            )
             if not configured_model:
                 raise ValueError(
                     f"providers[{provider_index}].models[{model_index}] must not be empty"
                 )
-            model_name = (
-                ANTHROPIC_ROLE_MODEL_ALIASES[anthropic_role]
-                if anthropic_role
-                else configured_model
-            )
+            model_name = alias_model_name if alias_model_name else configured_model
             return model_name, configured_model, anthropic_role
 
         if not isinstance(model_entry, dict):
@@ -509,9 +524,17 @@ class RouterState:
         if model_name is None:
             model_name = configured_model
 
-        configured_model, inferred_role = _split_model_role_suffix(str(configured_model))
+        configured_model, inferred_model_name, inferred_role = _split_model_mapping_suffix(
+            str(configured_model)
+        )
         if inferred_role and anthropic_role is None:
             anthropic_role = inferred_role
+        if (
+            inferred_model_name
+            and "model_name" not in model_entry
+            and "name" not in model_entry
+        ):
+            model_name = inferred_model_name
         if anthropic_role and "model_name" not in model_entry and "name" not in model_entry:
             model_name = ANTHROPIC_ROLE_MODEL_ALIASES[anthropic_role]
 

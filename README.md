@@ -126,6 +126,13 @@ models:
   - deepseek-v4-pro:opus
 ```
 
+- Exact Claude alias suffix form, for routing a known Claude Code model id:
+
+```yaml
+models:
+  - deepseek-v4-flash:claude-haiku-4-5-20251001
+```
+
 - Mapping form, for aliases or provider-specific upstream names:
 
 ```yaml
@@ -157,7 +164,7 @@ models:
 ## Behavior Notes
 
 - For a requested model, the proxy tries only providers whose `models` list includes that model, ordered by lowest `order` first.
-- For `/v1/messages`, `:haiku`, `:sonnet`, and `:opus` model suffixes expose Claude Code-safe aliases: `claude-haiku-4-5`, `claude-sonnet-4-6`, and `claude-opus-4-7`.
+- For `/v1/messages`, `:haiku`, `:sonnet`, and `:opus` model suffixes expose Claude Code-safe aliases: `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, and `claude-opus-4-7`.
 - Claude Code's `[1M]` suffix is accepted for routing, then stripped before matching. For example, `claude-opus-4-7[1M]` routes as `claude-opus-4-7`.
 - Anthropic role aliases are only local routing names. Upstream requests use the configured provider model, such as `deepseek-v4-pro`.
 - Session stickiness is enabled by default for 30 minutes.
