@@ -236,8 +236,9 @@ models:
 - Claude Code's `[1M]` suffix is accepted for routing, then stripped before matching. For example, `claude-opus-4-7[1M]` routes as `claude-opus-4-7`.
 - Anthropic role aliases are only local routing names. Upstream requests use the configured provider model, such as `deepseek-v4-pro`.
 - Session stickiness is enabled by default for 30 minutes.
-- Session key extraction order is: `x-fallback-session` header, then request body `conversation_id`, `thread_id`, `previous_response_id`, `user`, then the same keys under `metadata`.
+- Session key extraction order is: `x-fallback-session` header, then request body `conversation_id`, `thread_id`, `previous_response_id`, OpenAI Responses `prompt_cache_key`, `user`, then the same session-like keys under `metadata`. Claude Code's JSON-encoded `metadata.user_id.session_id` is also accepted.
 - Stickiness is applied per `session + endpoint + model alias`.
+- For an existing sticky session, the bound provider stays preferred until the sticky TTL expires or that provider has a counted failure, even if a higher-priority provider's cooldown has expired.
 - Cooldown state is tracked per `provider + endpoint + model alias`, not globally.
 - A provider enters cooldown only when its counted failure count becomes greater than `allowed_fails`.
 - After cooldown expires, new requests automatically go back to the higher-priority provider.

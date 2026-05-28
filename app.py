@@ -176,7 +176,7 @@ def _endpoint_type_supports_endpoint(endpoint_type: str | None, endpoint: str) -
     if endpoint_type == "anthropic":
         return endpoint == "/messages"
     if endpoint_type == "responses":
-        return endpoint == "/responses"
+        return endpoint == "/responses" or endpoint == "/responses/compact"
     if endpoint_type == "openai-compatible":
         return endpoint == "/chat/completions"
     return False
@@ -311,6 +311,7 @@ def _extract_session_key(request: Request, payload: dict[str, Any]) -> str | Non
         ("conversation_id", payload.get("conversation_id")),
         ("thread_id", payload.get("thread_id")),
         ("previous_response_id", payload.get("previous_response_id")),
+        ("prompt_cache_key", payload.get("prompt_cache_key")),
         ("user", payload.get("user")),
     )
     for name, value in candidates:
@@ -319,10 +320,26 @@ def _extract_session_key(request: Request, payload: dict[str, Any]) -> str | Non
 
     metadata = payload.get("metadata")
     if isinstance(metadata, dict):
-        for name in ("conversation_id", "thread_id", "session_id", "user"):
+        for name in ("conversation_id", "thread_id", "session_id"):
             value = metadata.get(name)
             if isinstance(value, str) and value.strip():
                 return f"metadata:{name}|{value.strip()}"
+
+        user_id = metadata.get("user_id")
+        if isinstance(user_id, str) and user_id.strip():
+            try:
+                parsed_user_id = json.loads(user_id)
+            except Exception:
+                parsed_user_id = None
+            if isinstance(parsed_user_id, dict):
+                for name in ("conversation_id", "thread_id", "session_id"):
+                    value = parsed_user_id.get(name)
+                    if isinstance(value, str) and value.strip():
+                        return f"metadata:user_id:{name}|{value.strip()}"
+
+        value = metadata.get("user")
+        if isinstance(value, str) and value.strip():
+            return f"metadata:user|{value.strip()}"
 
     return None
 
@@ -1945,6 +1962,11 @@ async def responses_api(request: Request) -> Any:
 @app.post("/responses")
 async def responses_api_root(request: Request) -> Any:
     return await forward_request(request, "/responses")
+
+
+@app.post("/v1/responses/compact")
+async def responses_compact_api(request: Request) -> Any:
+    return await forward_request(request, "/responses/compact")
 
 
 @app.post("/v1/messages")

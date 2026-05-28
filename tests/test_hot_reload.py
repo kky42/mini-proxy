@@ -9,6 +9,7 @@ import time
 import unittest
 from collections.abc import AsyncIterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -116,6 +117,44 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "rejected")
         self.assertFalse(result.reloaded)
         self.assertEqual(models[0]["providers"][0]["api_base"], "https://one.example/v1")
+
+    def test_extract_session_key_uses_responses_prompt_cache_key(self) -> None:
+        request = SimpleNamespace(headers={})
+
+        session_key = app_module._extract_session_key(
+            request,
+            {
+                "model": "gpt-test",
+                "prompt_cache_key": " 019e6d5d-27c5-7244-a97c-71b41d81f3b9 ",
+            },
+        )
+
+        self.assertEqual(
+            session_key,
+            "prompt_cache_key|019e6d5d-27c5-7244-a97c-71b41d81f3b9",
+        )
+
+    def test_extract_session_key_uses_claude_metadata_user_id_session_id(self) -> None:
+        request = SimpleNamespace(headers={})
+
+        session_key = app_module._extract_session_key(
+            request,
+            {
+                "model": "claude-sonnet-4-6",
+                "metadata": {
+                    "user_id": (
+                        '{"device_id":"device-test",'
+                        '"account_uuid":"",'
+                        '"session_id":"ec5bf141-a549-4540-835e-63af0155c8e9"}'
+                    ),
+                },
+            },
+        )
+
+        self.assertEqual(
+            session_key,
+            "metadata:user_id:session_id|ec5bf141-a549-4540-835e-63af0155c8e9",
+        )
 
     async def test_reload_auto_model_discovery_does_not_block_event_loop(self) -> None:
         self.config_path.write_text(
