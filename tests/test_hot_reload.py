@@ -7,6 +7,7 @@ import threading
 import tempfile
 import time
 import unittest
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -267,6 +268,144 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(gpt_b_candidates[0].upstream_model, "provider-gpt-b")
         self.assertEqual([model["id"] for model in models], ["gpt-a", "gpt-b", "gpt-c"])
 
+    async def test_provider_name_is_required_and_unique(self) -> None:
+        self.config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "providers": [
+                        {
+                            "api_base": "https://missing-name.example/v1",
+                            "api_key": "sk-one",
+                            "models": ["gpt-test"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "providers\\[0\\]\\.name is required"):
+            app_module.RouterState(str(self.config_path))
+
+        self.config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "providers": [
+                        {
+                            "name": "duplicate",
+                            "api_base": "https://one.example/v1",
+                            "api_key": "sk-one",
+                            "models": ["gpt-test"],
+                        },
+                        {
+                            "name": "duplicate",
+                            "api_base": "https://two.example/v1",
+                            "api_key": "sk-two",
+                            "models": ["gpt-test"],
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "providers\\[1\\]\\.name must be unique: duplicate",
+        ):
+            app_module.RouterState(str(self.config_path))
+
+    async def test_provider_name_is_provider_id_for_same_route_url(self) -> None:
+        data: dict[str, Any] = {
+            "providers": [
+                {
+                    "name": "same-url-one",
+                    "api_base": "https://same.example/v1",
+                    "api_key": "sk-one",
+                    "order": 1,
+                    "models": ["gpt-test"],
+                },
+                {
+                    "name": "same-url-two",
+                    "api_base": "https://same.example/v1",
+                    "api_key": "sk-two",
+                    "order": 1,
+                    "models": ["gpt-test"],
+                },
+            ]
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        self.state = app_module.RouterState(str(self.config_path))
+
+        candidates = await self.state.get_candidate_providers(
+            "gpt-test",
+            "/responses",
+            sticky_key=None,
+        )
+        await self.state.record_failure(
+            candidates[0],
+            "/responses",
+            "synthetic failure",
+            app_module.FailureDecision(
+                failure_class=app_module.FailureClass.AVAILABILITY,
+                should_fallback=True,
+                count_failure=True,
+            ),
+        )
+        snapshot = await self.state.snapshot()
+
+        self.assertEqual(
+            [provider.provider_id for provider in candidates],
+            ["same-url-one", "same-url-two"],
+        )
+        self.assertEqual(
+            {
+                provider["provider_name"]: provider["provider_id"]
+                for provider in snapshot["providers"]
+            },
+            {
+                "same-url-one": "same-url-one",
+                "same-url-two": "same-url-two",
+            },
+        )
+        self.assertEqual(
+            {
+                provider["provider_name"]: provider["last_error"]["/responses"]
+                for provider in snapshot["providers"]
+            },
+            {
+                "same-url-one": "synthetic failure",
+                "same-url-two": None,
+            },
+        )
+
+    async def test_config_load_logs_provider_model_summary_without_api_keys(self) -> None:
+        data: dict[str, Any] = {
+            "providers": [
+                {
+                    "name": "responses",
+                    "api_base": "https://responses.example",
+                    "api_key": "sk-secret",
+                    "order": 1,
+                    "endpoint_type": "responses",
+                    "models": ["gpt-a", "gpt-b"],
+                }
+            ]
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+        with self.assertLogs("uvicorn.error", level="INFO") as logs:
+            self.state = app_module.RouterState(str(self.config_path))
+
+        output = "\n".join(logs.output)
+        self.assertIn("Loaded config: 1 providers, 2 model routes", output)
+        self.assertIn(
+            "Provider responses endpoint=responses order=1 models=explicit "
+            "count=2 ids=gpt-a,gpt-b",
+            output,
+        )
+        self.assertNotIn("sk-secret", output)
+
     async def test_string_mapping_suffix_exposes_alias_and_forwards_upstream_model(
         self,
     ) -> None:
@@ -353,7 +492,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([model["id"] for model in models], ["gpt-auto-a", "gpt-auto-b"])
         self.assertEqual(candidates[0].upstream_model, "gpt-auto-a")
 
-    async def test_auto_models_are_filtered_by_endpoint_type(self) -> None:
+    async def test_auto_models_are_filtered_by_endpoint_type_when_some_match(self) -> None:
         data: dict[str, Any] = {
             "providers": [
                 {
@@ -410,6 +549,76 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
                 "/chat/completions",
                 sticky_key=None,
             )
+
+    async def test_auto_models_keep_discovered_ids_when_metadata_all_conflicts(
+        self,
+    ) -> None:
+        data: dict[str, Any] = {
+            "providers": [
+                {
+                    "name": "responses",
+                    "api_base": "https://responses.example",
+                    "api_key": "sk-provider",
+                    "order": 1,
+                    "endpoint_type": "responses",
+                    "models": "auto",
+                }
+            ]
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+        def fake_get(url: str, **kwargs: Any) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "gpt-5.4",
+                            "object": "model",
+                            "supported_endpoint_types": ["openai"],
+                        },
+                        {
+                            "id": "gpt-5.4-mini",
+                            "object": "model",
+                            "supported_endpoint_types": ["openai"],
+                        },
+                    ],
+                },
+            )
+
+        original_get = app_module.httpx.get
+        app_module.httpx.get = fake_get
+        try:
+            with self.assertLogs("uvicorn.error", level="WARNING") as logs:
+                self.state = app_module.RouterState(str(self.config_path))
+        finally:
+            app_module.httpx.get = original_get
+
+        models = await self.state.list_models()
+        candidates = await self.state.get_candidate_providers(
+            "gpt-5.4-mini",
+            "/responses",
+            sticky_key=None,
+        )
+        snapshot = await self.state.snapshot()
+
+        self.assertEqual([model["id"] for model in models], ["gpt-5.4", "gpt-5.4-mini"])
+        self.assertEqual(candidates[0].upstream_model, "gpt-5.4-mini")
+        self.assertIn("keeping discovered IDs", "\n".join(logs.output))
+        self.assertEqual(snapshot["providers"][0]["model_source"], "auto")
+        self.assertEqual(
+            snapshot["providers"][0]["discovered_model_ids"],
+            ["gpt-5.4", "gpt-5.4-mini"],
+        )
+        self.assertEqual(
+            snapshot["providers"][0]["filtered_model_ids"],
+            ["gpt-5.4", "gpt-5.4-mini"],
+        )
+        self.assertIn(
+            "keeping discovered IDs",
+            snapshot["providers"][0]["discovery_warnings"][0],
+        )
 
     async def test_anthropic_role_suffix_maps_claude_alias_to_provider_model(self) -> None:
         data: dict[str, Any] = {
@@ -941,6 +1150,404 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [attempt["json"]["model"] for attempt in captured],
             ["bad-model", "good-model"],
+        )
+
+    async def test_responses_stream_error_event_falls_back_before_streaming(self) -> None:
+        data: dict[str, Any] = {
+            "app_settings": {"hot_reload": False},
+            "providers": [
+                {
+                    "name": "stream-error",
+                    "api_base": "https://stream-error.example",
+                    "api_key": "sk-bad",
+                    "order": 1,
+                    "endpoint_type": "responses",
+                    "models": ["gpt-test"],
+                },
+                {
+                    "name": "stream-good",
+                    "api_base": "https://stream-good.example",
+                    "api_key": "sk-good",
+                    "order": 2,
+                    "endpoint_type": "responses",
+                    "models": ["gpt-test"],
+                },
+            ],
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        self.state = app_module.RouterState(str(self.config_path))
+        captured: list[dict[str, Any]] = []
+
+        class FakeStreamResponse:
+            def __init__(self, *, headers: dict[str, str], chunks: list[bytes]) -> None:
+                self.status_code = 200
+                self.headers = headers
+                self._chunks = chunks
+                self.is_closed = False
+                self.is_stream_consumed = False
+
+            async def aiter_bytes(self) -> AsyncIterator[bytes]:
+                if self.is_stream_consumed:
+                    raise httpx.StreamConsumed()
+                self.is_stream_consumed = True
+                for chunk in self._chunks:
+                    yield chunk
+
+            async def aread(self) -> bytes:
+                return b"".join(self._chunks)
+
+            async def aclose(self) -> None:
+                self.is_closed = True
+
+        class FakeAsyncClient:
+            def __init__(self, **_: Any) -> None:
+                pass
+
+            def build_request(
+                self,
+                method: str,
+                url: str,
+                *,
+                headers: dict[str, str],
+                json: dict[str, Any],
+                timeout: Any,
+            ) -> dict[str, Any]:
+                return {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "json": json,
+                    "timeout": timeout,
+                }
+
+            async def send(
+                self,
+                request: dict[str, Any],
+                *,
+                stream: bool,
+            ) -> FakeStreamResponse:
+                captured.append(request)
+                if "stream-error.example" in request["url"]:
+                    return FakeStreamResponse(
+                        headers={"content-type": "text/event-stream"},
+                        chunks=[
+                            (
+                                "event:\n"
+                                'data: {"error":{"type":"rate_limit_error",'
+                                '"message":"Concurrency limit exceeded"}}\n\n'
+                            ).encode(),
+                        ],
+                    )
+                return FakeStreamResponse(
+                    headers={"content-type": "text/event-stream"},
+                    chunks=[
+                        (
+                            "event: response.created\n"
+                            'data: {"type":"response.created","response":'
+                            '{"id":"resp-test","status":"in_progress"}}\n\n'
+                        ).encode(),
+                        (
+                            "event: response.completed\n"
+                            'data: {"type":"response.completed","response":'
+                            '{"id":"resp-test","status":"completed"}}\n\n'
+                        ).encode(),
+                    ],
+                )
+
+            async def aclose(self) -> None:
+                pass
+
+        original_state = app_module.router_state
+        original_client = app_module.httpx.AsyncClient
+        app_module.router_state = self.state
+        app_module.httpx.AsyncClient = FakeAsyncClient
+        try:
+            client = TestClient(app_module.app)
+            with client.stream(
+                "POST",
+                "/v1/responses",
+                json={"model": "gpt-test", "input": "hello", "stream": True},
+            ) as response:
+                body = response.read().decode()
+        finally:
+            app_module.router_state = original_state
+            app_module.httpx.AsyncClient = original_client
+
+        snapshot = await self.state.snapshot()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("response.completed", body)
+        self.assertEqual(
+            [attempt["json"]["model"] for attempt in captured],
+            ["gpt-test", "gpt-test"],
+        )
+        self.assertEqual(
+            response.headers["x-fallback-provider-id"],
+            "stream-good",
+        )
+        self.assertIn(
+            "Responses stream error event",
+            {
+                provider["provider_name"]: provider["last_error"]["/responses"]
+                for provider in snapshot["providers"]
+            }["stream-error"],
+        )
+
+    async def test_responses_stream_start_timeout_falls_back_before_streaming(
+        self,
+    ) -> None:
+        data: dict[str, Any] = {
+            "app_settings": {"hot_reload": False, "stream_start_timeout": 0.01},
+            "providers": [
+                {
+                    "name": "stream-stalled",
+                    "api_base": "https://stream-stalled.example",
+                    "api_key": "sk-stalled",
+                    "order": 1,
+                    "endpoint_type": "responses",
+                    "models": ["gpt-test"],
+                },
+                {
+                    "name": "stream-good",
+                    "api_base": "https://stream-good.example",
+                    "api_key": "sk-good",
+                    "order": 2,
+                    "endpoint_type": "responses",
+                    "models": ["gpt-test"],
+                },
+            ],
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        self.state = app_module.RouterState(str(self.config_path))
+        captured: list[dict[str, Any]] = []
+
+        class FakeStreamResponse:
+            def __init__(
+                self,
+                *,
+                headers: dict[str, str],
+                chunks: list[bytes],
+                first_chunk_delay: float = 0,
+            ) -> None:
+                self.status_code = 200
+                self.headers = headers
+                self._chunks = chunks
+                self._first_chunk_delay = first_chunk_delay
+                self.is_closed = False
+                self.is_stream_consumed = False
+
+            async def aiter_bytes(self) -> AsyncIterator[bytes]:
+                if self.is_stream_consumed:
+                    raise httpx.StreamConsumed()
+                self.is_stream_consumed = True
+                if self._first_chunk_delay:
+                    await asyncio.sleep(self._first_chunk_delay)
+                for chunk in self._chunks:
+                    yield chunk
+
+            async def aread(self) -> bytes:
+                return b"".join(self._chunks)
+
+            async def aclose(self) -> None:
+                self.is_closed = True
+
+        class FakeAsyncClient:
+            def __init__(self, **_: Any) -> None:
+                pass
+
+            def build_request(
+                self,
+                method: str,
+                url: str,
+                *,
+                headers: dict[str, str],
+                json: dict[str, Any],
+                timeout: Any,
+            ) -> dict[str, Any]:
+                return {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "json": json,
+                    "timeout": timeout,
+                }
+
+            async def send(
+                self,
+                request: dict[str, Any],
+                *,
+                stream: bool,
+            ) -> FakeStreamResponse:
+                captured.append(request)
+                if "stream-stalled.example" in request["url"]:
+                    return FakeStreamResponse(
+                        headers={"content-type": "text/event-stream"},
+                        chunks=[],
+                        first_chunk_delay=10,
+                    )
+                return FakeStreamResponse(
+                    headers={"content-type": "text/event-stream"},
+                    chunks=[
+                        (
+                            "event: response.completed\n"
+                            'data: {"type":"response.completed","response":'
+                            '{"id":"resp-test","status":"completed"}}\n\n'
+                        ).encode(),
+                    ],
+                )
+
+            async def aclose(self) -> None:
+                pass
+
+        original_state = app_module.router_state
+        original_client = app_module.httpx.AsyncClient
+        app_module.router_state = self.state
+        app_module.httpx.AsyncClient = FakeAsyncClient
+        try:
+            client = TestClient(app_module.app)
+            with client.stream(
+                "POST",
+                "/v1/responses",
+                json={"model": "gpt-test", "input": "hello", "stream": True},
+            ) as response:
+                body = response.read().decode()
+        finally:
+            app_module.router_state = original_state
+            app_module.httpx.AsyncClient = original_client
+
+        snapshot = await self.state.snapshot()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("response.completed", body)
+        self.assertEqual(
+            [attempt["json"]["model"] for attempt in captured],
+            ["gpt-test", "gpt-test"],
+        )
+        self.assertEqual(response.headers["x-fallback-provider-id"], "stream-good")
+        self.assertIn(
+            "Responses stream did not start within",
+            {
+                provider["provider_name"]: provider["last_error"]["/responses"]
+                for provider in snapshot["providers"]
+            }["stream-stalled"],
+        )
+
+    async def test_responses_stream_send_timeout_falls_back_before_streaming(
+        self,
+    ) -> None:
+        data: dict[str, Any] = {
+            "app_settings": {"hot_reload": False, "stream_start_timeout": 0.01},
+            "providers": [
+                {
+                    "name": "send-stalled",
+                    "api_base": "https://send-stalled.example",
+                    "api_key": "sk-stalled",
+                    "order": 1,
+                    "endpoint_type": "responses",
+                    "models": ["gpt-test"],
+                },
+                {
+                    "name": "stream-good",
+                    "api_base": "https://stream-good.example",
+                    "api_key": "sk-good",
+                    "order": 2,
+                    "endpoint_type": "responses",
+                    "models": ["gpt-test"],
+                },
+            ],
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        self.state = app_module.RouterState(str(self.config_path))
+        captured: list[dict[str, Any]] = []
+
+        class FakeStreamResponse:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+            is_closed = False
+            is_stream_consumed = False
+
+            async def aiter_bytes(self) -> AsyncIterator[bytes]:
+                if self.is_stream_consumed:
+                    raise httpx.StreamConsumed()
+                self.is_stream_consumed = True
+                yield (
+                    "event: response.completed\n"
+                    'data: {"type":"response.completed","response":'
+                    '{"id":"resp-test","status":"completed"}}\n\n'
+                ).encode()
+
+            async def aread(self) -> bytes:
+                return b""
+
+            async def aclose(self) -> None:
+                self.is_closed = True
+
+        class FakeAsyncClient:
+            def __init__(self, **_: Any) -> None:
+                pass
+
+            def build_request(
+                self,
+                method: str,
+                url: str,
+                *,
+                headers: dict[str, str],
+                json: dict[str, Any],
+                timeout: Any,
+            ) -> dict[str, Any]:
+                return {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "json": json,
+                    "timeout": timeout,
+                }
+
+            async def send(
+                self,
+                request: dict[str, Any],
+                *,
+                stream: bool,
+            ) -> FakeStreamResponse:
+                captured.append(request)
+                if "send-stalled.example" in request["url"]:
+                    await asyncio.sleep(10)
+                return FakeStreamResponse()
+
+            async def aclose(self) -> None:
+                pass
+
+        original_state = app_module.router_state
+        original_client = app_module.httpx.AsyncClient
+        app_module.router_state = self.state
+        app_module.httpx.AsyncClient = FakeAsyncClient
+        try:
+            client = TestClient(app_module.app)
+            with client.stream(
+                "POST",
+                "/v1/responses",
+                json={"model": "gpt-test", "input": "hello", "stream": True},
+            ) as response:
+                body = response.read().decode()
+        finally:
+            app_module.router_state = original_state
+            app_module.httpx.AsyncClient = original_client
+
+        snapshot = await self.state.snapshot()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("response.completed", body)
+        self.assertEqual(
+            [attempt["json"]["model"] for attempt in captured],
+            ["gpt-test", "gpt-test"],
+        )
+        self.assertEqual(response.headers["x-fallback-provider-id"], "stream-good")
+        self.assertIn(
+            "TimeoutError",
+            {
+                provider["provider_name"]: provider["last_error"]["/responses"]
+                for provider in snapshot["providers"]
+            }["send-stalled"],
         )
 
     async def test_root_models_endpoint_matches_v1_models_endpoint(self) -> None:

@@ -104,6 +104,7 @@ providers:
 - `log_level`: uvicorn log level. Default `info`.
 - `default_timeout`: request timeout in seconds when neither request body nor provider sets a timeout. Default `60`.
   For streaming requests, this proxy keeps `connect`/`write`/`pool` bounded but disables the upstream `read` timeout so long-thinking SSE streams are not cut off mid-response.
+- `stream_start_timeout`: maximum seconds to wait for the first upstream SSE event before falling back. Default `30`, or `default_timeout` if lower.
 - `sticky_ttl_seconds`: optional session stickiness TTL in seconds. Default `1800`, so you do not need to set it unless you want to override it.
 - `normalize_upstream_model`: if `true`, `openai/gpt-5.4` becomes `gpt-5.4` before forwarding upstream. Default `true`.
 - `hot_reload`: if `true`, the proxy polls the config file and applies valid edits without restart. Default `true`.
@@ -118,7 +119,7 @@ providers:
 
 `providers[*]`
 
-- `name`: optional provider label shown in debug/model output.
+- `name`: required unique provider id. It is shown in logs/debug output and used for cooldown and sticky routing state.
 - `api_base`: provider service root. MiniProxy builds the upstream request URL
   from this value and `endpoint_type`. If it already ends in `/v1`, MiniProxy
   appends the endpoint path directly; otherwise it inserts `/v1` first.
@@ -153,7 +154,7 @@ providers:
 
 By default, discovery calls `{api_base}/models` when `api_base` already ends with `/v1`; otherwise it calls `{api_base}/v1/models`. Set `models_url` if a provider exposes model discovery somewhere else.
 
-For `endpoint_type: anthropic`, discovery uses Anthropic-style headers: `x-api-key` and `anthropic-version`. Other endpoint types use OpenAI-style bearer auth. If the provider's model response includes `supported_endpoint_types`, the proxy filters discovered models to the configured `endpoint_type`.
+For `endpoint_type: anthropic`, discovery uses Anthropic-style headers: `x-api-key` and `anthropic-version`. Other endpoint types use OpenAI-style bearer auth. If the provider's model response includes `supported_endpoint_types`, the proxy filters discovered models to the configured `endpoint_type` when some models match. If metadata would filter out every discovered model, MiniProxy keeps the discovered IDs and logs a warning, treating the configured `endpoint_type` as the source of truth.
 
 `models: auto` discovery never uses `api_url` as a fallback because `api_url`
 can point at an exact request endpoint. If `models` is `auto`, configure either
@@ -242,10 +243,11 @@ models:
 - After cooldown expires, new requests automatically go back to the higher-priority provider.
 - Request body `timeout` overrides provider timeout, which overrides `app_settings.default_timeout`.
 - For streaming requests, the selected timeout still applies to connect/write/pool, but upstream idle reads are left unbounded to avoid false reconnect loops.
-- Streaming fallback is only supported before the upstream stream starts.
+- Streaming fallback is supported before the upstream stream starts. After the first upstream SSE event has been sent to the client, mid-stream failures cannot be transparently replayed on another provider.
 - Failures and cooldown state live in memory only.
 - Config hot reload is enabled by default. Valid changes to routes, providers, timeouts, cooldown settings, stickiness TTL, and model normalization are applied automatically.
 - If a changed config is invalid, the proxy keeps serving with the last good config and records the error in `/debug/state`.
+- Startup and successful reloads log a config summary with provider names, endpoint types, orders, model source (`explicit` or `auto`), model counts, and model IDs. API keys are never logged.
 - For your current `jucode` setup, `responses` works with bare model names such as `gpt-5.4`. This proxy normalizes `openai/gpt-5.4` to `gpt-5.4` by default.
 
 Built-in default failure policy:

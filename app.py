@@ -19,10 +19,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 
+logger = logging.getLogger("uvicorn.error")
 CONFIG_PATH = os.environ.get("MINI_FALLBACK_PROXY_CONFIG")
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_STICKY_TTL_SECONDS = 1800
 DEFAULT_HOT_RELOAD_INTERVAL_SECONDS = 1.0
+DEFAULT_STREAM_START_TIMEOUT = 30.0
 ANTHROPIC_VERSION = "2023-06-01"
 ANTHROPIC_ROLE_MODEL_ALIASES = {
     "haiku": "claude-haiku-4-5-20251001",
@@ -223,8 +225,7 @@ def _iter_sse_events(body_text: str) -> list[tuple[str | None, str]]:
     return events
 
 
-def _extract_responses_json_from_sse(body: bytes) -> dict[str, Any] | None:
-    body_text = body.decode("utf-8", errors="replace")
+def _extract_responses_json_from_sse_text(body_text: str) -> dict[str, Any] | None:
     completed_response: dict[str, Any] | None = None
 
     for event_name, data in _iter_sse_events(body_text):
@@ -245,6 +246,30 @@ def _extract_responses_json_from_sse(body: bytes) -> dict[str, Any] | None:
                 completed_response = response
 
     return completed_response
+
+
+def _extract_responses_json_from_sse(body: bytes) -> dict[str, Any] | None:
+    body_text = body.decode("utf-8", errors="replace")
+    return _extract_responses_json_from_sse_text(body_text)
+
+
+def _extract_sse_error_message(body_text: str) -> str | None:
+    for event_name, data in _iter_sse_events(body_text):
+        try:
+            payload = json.loads(data)
+        except Exception:
+            if event_name == "error":
+                return data[:500]
+            continue
+
+        if event_name != "error" and not (
+            isinstance(payload, dict) and payload.get("error") is not None
+        ):
+            continue
+
+        message = _extract_error_message(payload, data)
+        return message[:500]
+    return None
 
 
 def _extract_error_code(payload: dict[str, Any] | None) -> str | None:
@@ -447,7 +472,7 @@ class StickyBinding:
 
 @dataclass(frozen=True)
 class Provider:
-    provider_name: str | None
+    provider_name: str
     model_name: str
     configured_model: str
     upstream_model: str
@@ -460,11 +485,15 @@ class Provider:
     order: int
     timeout: float | None
     extra_headers: dict[str, str]
+    provider_index: int = -1
+    model_source: str = "explicit"
+    discovered_model_ids: tuple[str, ...] = ()
+    filtered_model_ids: tuple[str, ...] = ()
+    discovery_warnings: tuple[str, ...] = ()
 
     @property
     def provider_id(self) -> str:
-        route_url = self.api_url or self.api_base or ""
-        return f"{self.model_name}|{self.order}|{route_url}|{self.upstream_model}"
+        return self.provider_name
 
     @property
     def sort_url(self) -> str:
@@ -477,6 +506,7 @@ class RouterConfig:
     port: int
     log_level: str
     default_timeout: float
+    stream_start_timeout: float
     sticky_ttl_seconds: int
     normalize_upstream_model: bool
     hot_reload: bool
@@ -487,6 +517,14 @@ class RouterConfig:
 
 
 @dataclass(frozen=True)
+class AutoModelDiscovery:
+    models: list[str]
+    discovered_models: tuple[str, ...]
+    filtered_models: tuple[str, ...]
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ReloadResult:
     status: str
     reloaded: bool
@@ -494,7 +532,7 @@ class ReloadResult:
 
 
 def build_failure_key(provider: Provider, endpoint: str) -> str:
-    return f"{provider.provider_id}|{endpoint}|{provider.model_name}"
+    return f"{provider.provider_id}|{endpoint}|{provider.model_name}|{provider.upstream_model}"
 
 
 def build_sticky_key(session_key: str, endpoint: str, model_name: str) -> str:
@@ -512,6 +550,10 @@ def provider_debug_dict(provider: Provider) -> dict[str, Any]:
         "upstream_model": provider.upstream_model,
         "anthropic_role": provider.anthropic_role,
         "endpoint_type": provider.endpoint_type,
+        "model_source": provider.model_source,
+        "discovered_model_ids": list(provider.discovered_model_ids),
+        "filtered_model_ids": list(provider.filtered_model_ids),
+        "discovery_warnings": list(provider.discovery_warnings),
         "upstream_urls": {
             "/responses": build_upstream_url(provider, "/responses"),
             "/chat/completions": build_upstream_url(provider, "/chat/completions"),
@@ -538,7 +580,12 @@ def provider_response_headers(provider: Provider, url: str) -> dict[str, str]:
         headers["x-fallback-api-base"] = provider.api_base
     if provider.api_url is not None:
         headers["x-fallback-api-url"] = provider.api_url
+    headers["x-fallback-provider-name"] = provider.provider_name
     return headers
+
+
+def _format_model_ids(model_ids: list[str] | tuple[str, ...]) -> str:
+    return ",".join(model_ids) if model_ids else "(none)"
 
 
 class RouterState:
@@ -553,6 +600,7 @@ class RouterState:
         self.cooldown_time = 300
         self.sticky_ttl_seconds = DEFAULT_STICKY_TTL_SECONDS
         self.default_timeout = DEFAULT_TIMEOUT
+        self.stream_start_timeout = DEFAULT_STREAM_START_TIMEOUT
         self.host = "127.0.0.1"
         self.port = 8099
         self.log_level = "info"
@@ -570,13 +618,18 @@ class RouterState:
     def _build_provider(
         self,
         *,
-        provider_name: str | None,
+        provider_index: int,
+        provider_name: str,
         model_name: str,
         configured_model: str,
         anthropic_role: str | None,
         endpoint_type: str | None,
         provider_params: dict[str, Any],
         normalize_upstream_model: bool,
+        model_source: str,
+        discovered_model_ids: tuple[str, ...],
+        filtered_model_ids: tuple[str, ...],
+        discovery_warnings: tuple[str, ...],
     ) -> Provider:
         upstream_model = configured_model
         if normalize_upstream_model:
@@ -595,6 +648,11 @@ class RouterState:
             order=int(provider_params.get("order", 100)),
             timeout=_coerce_optional_timeout(provider_params.get("timeout")),
             extra_headers=_coerce_headers(provider_params.get("headers")),
+            provider_index=provider_index,
+            model_source=model_source,
+            discovered_model_ids=discovered_model_ids,
+            filtered_model_ids=filtered_model_ids,
+            discovery_warnings=discovery_warnings,
         )
 
     def _coerce_model_entry(
@@ -682,7 +740,7 @@ class RouterState:
         *,
         provider_index: int,
         endpoint_type: str | None,
-    ) -> list[str]:
+    ) -> AutoModelDiscovery:
         headers = {"Accept": "application/json"}
         if endpoint_type == "anthropic":
             headers["x-api-key"] = str(provider_params["api_key"])
@@ -710,6 +768,8 @@ class RouterState:
             )
 
         discovered: list[str] = []
+        filtered: list[str] = []
+        advertised_supported_types: set[str] = set()
         for item in data:
             if not isinstance(item, dict):
                 continue
@@ -717,6 +777,8 @@ class RouterState:
             if not isinstance(model_id, str) or not model_id.strip():
                 continue
 
+            normalized_model_id = model_id.strip()
+            discovered.append(normalized_model_id)
             supported_types = item.get("supported_endpoint_types")
             if endpoint_type and isinstance(supported_types, list):
                 normalized_supported_types = {
@@ -729,14 +791,35 @@ class RouterState:
                     )
                     for supported_type in supported_types
                 }
+                advertised_supported_types.update(
+                    supported_type
+                    for supported_type in normalized_supported_types
+                    if supported_type is not None
+                )
                 if endpoint_type not in normalized_supported_types:
                     continue
 
-            discovered.append(model_id.strip())
+            filtered.append(normalized_model_id)
 
         if not discovered:
             raise ValueError(f"providers[{provider_index}].models auto discovered no models")
-        return discovered
+
+        warnings: list[str] = []
+        if endpoint_type and advertised_supported_types and not filtered:
+            advertised = ", ".join(sorted(advertised_supported_types))
+            warnings.append(
+                "discovered models advertise supported_endpoint_types="
+                f"{advertised}, configured endpoint_type={endpoint_type}; "
+                "keeping discovered IDs"
+            )
+            filtered = list(discovered)
+
+        return AutoModelDiscovery(
+            models=filtered,
+            discovered_models=tuple(discovered),
+            filtered_models=tuple(filtered),
+            warnings=tuple(warnings),
+        )
 
     def _load_providers(
         self,
@@ -752,9 +835,24 @@ class RouterState:
             raise ValueError("providers must be a list")
 
         grouped: dict[str, list[Provider]] = {}
+        seen_provider_names: set[str] = set()
         for provider_index, provider_params in enumerate(providers_config):
             if not isinstance(provider_params, dict):
                 raise ValueError(f"providers[{provider_index}] must be a mapping")
+
+            provider_name_value = provider_params.get("name")
+            provider_name = (
+                str(provider_name_value).strip()
+                if provider_name_value is not None
+                else ""
+            )
+            if not provider_name:
+                raise ValueError(f"providers[{provider_index}].name is required")
+            if provider_name in seen_provider_names:
+                raise ValueError(
+                    f"providers[{provider_index}].name must be unique: {provider_name}"
+                )
+            seen_provider_names.add(provider_name)
 
             if "api_key" not in provider_params:
                 raise ValueError(f"providers[{provider_index}].api_key is required")
@@ -775,25 +873,25 @@ class RouterState:
                     "api_url is set"
                 )
             models = provider_params.get("models")
+            model_source = "explicit"
+            discovered_model_ids: tuple[str, ...] = ()
+            filtered_model_ids: tuple[str, ...] = ()
+            discovery_warnings: tuple[str, ...] = ()
             if isinstance(models, str) and models.strip().lower() == "auto":
-                models = self._load_auto_models(
+                auto_discovery = self._load_auto_models(
                     provider_params,
                     provider_index=provider_index,
                     endpoint_type=endpoint_type,
                 )
+                models = auto_discovery.models
+                model_source = "auto"
+                discovered_model_ids = auto_discovery.discovered_models
+                filtered_model_ids = auto_discovery.filtered_models
+                discovery_warnings = auto_discovery.warnings
             if not isinstance(models, list) or not models:
                 raise ValueError(
                     f"providers[{provider_index}].models must be a non-empty list or 'auto'"
                 )
-
-            provider_name_value = provider_params.get("name")
-            provider_name = (
-                str(provider_name_value).strip()
-                if provider_name_value is not None
-                else None
-            )
-            if provider_name == "":
-                provider_name = None
 
             for model_index, model_entry in enumerate(models):
                 model_name, configured_model, anthropic_role = self._coerce_model_entry(
@@ -809,6 +907,11 @@ class RouterState:
                     endpoint_type=endpoint_type,
                     provider_params=provider_params,
                     normalize_upstream_model=normalize_upstream_model,
+                    provider_index=provider_index,
+                    model_source=model_source,
+                    discovered_model_ids=discovered_model_ids,
+                    filtered_model_ids=filtered_model_ids,
+                    discovery_warnings=discovery_warnings,
                 )
                 grouped.setdefault(model_name, []).append(provider)
 
@@ -833,6 +936,10 @@ class RouterState:
         port = int(app_settings.get("port", 8099))
         log_level = str(app_settings.get("log_level", "info"))
         default_timeout = float(app_settings.get("default_timeout", DEFAULT_TIMEOUT))
+        stream_start_timeout = _coerce_positive_float(
+            app_settings.get("stream_start_timeout"),
+            min(default_timeout, DEFAULT_STREAM_START_TIMEOUT),
+        )
         sticky_ttl_seconds = int(
             app_settings.get("sticky_ttl_seconds", DEFAULT_STICKY_TTL_SECONDS)
         )
@@ -862,6 +969,7 @@ class RouterState:
             port=port,
             log_level=log_level,
             default_timeout=default_timeout,
+            stream_start_timeout=stream_start_timeout,
             sticky_ttl_seconds=sticky_ttl_seconds,
             normalize_upstream_model=normalize_upstream_model,
             hot_reload=hot_reload,
@@ -876,6 +984,7 @@ class RouterState:
         self.port = config.port
         self.log_level = config.log_level
         self.default_timeout = config.default_timeout
+        self.stream_start_timeout = config.stream_start_timeout
         self.sticky_ttl_seconds = config.sticky_ttl_seconds
         self.normalize_upstream_model = config.normalize_upstream_model
         self.hot_reload = config.hot_reload
@@ -891,6 +1000,71 @@ class RouterState:
             config_mtime = None
         self.last_config_mtime = config_mtime
         self.last_observed_config_mtime = config_mtime
+        self._log_config_loaded()
+
+    def _provider_log_summaries(self) -> list[dict[str, Any]]:
+        summaries: dict[tuple[str | None, str | None, int, str], dict[str, Any]] = {}
+        for providers in self.providers_by_model.values():
+            for provider in providers:
+                route_url = provider.api_url or provider.api_base or ""
+                key = (
+                    provider.provider_name,
+                    provider.endpoint_type,
+                    provider.order,
+                    route_url,
+                )
+                summary = summaries.setdefault(
+                    key,
+                    {
+                        "name": provider.provider_name or "(unnamed)",
+                        "endpoint_type": provider.endpoint_type or "(any)",
+                        "order": provider.order,
+                        "model_source": provider.model_source,
+                        "models": set(),
+                        "discovered_model_ids": provider.discovered_model_ids,
+                        "filtered_model_ids": provider.filtered_model_ids,
+                        "discovery_warnings": provider.discovery_warnings,
+                    },
+                )
+                summary["models"].add(provider.model_name)
+        return sorted(
+            summaries.values(),
+            key=lambda item: (item["order"], item["name"], item["endpoint_type"]),
+        )
+
+    def _log_config_loaded(self) -> None:
+        provider_summaries = self._provider_log_summaries()
+        model_route_count = sum(
+            len(providers) for providers in self.providers_by_model.values()
+        )
+        logger.info(
+            "Loaded config: %s providers, %s model routes",
+            len(provider_summaries),
+            model_route_count,
+        )
+        for summary in provider_summaries:
+            models = sorted(summary["models"])
+            logger.info(
+                "Provider %s endpoint=%s order=%s models=%s count=%s ids=%s",
+                summary["name"],
+                summary["endpoint_type"],
+                summary["order"],
+                summary["model_source"],
+                len(models),
+                _format_model_ids(models),
+            )
+            if (
+                summary["model_source"] == "auto"
+                and set(summary["discovered_model_ids"]) != set(models)
+            ):
+                logger.info(
+                    "Provider %s auto-discovered count=%s ids=%s",
+                    summary["name"],
+                    len(summary["discovered_model_ids"]),
+                    _format_model_ids(summary["discovered_model_ids"]),
+                )
+            for warning in summary["discovery_warnings"]:
+                logger.warning("Provider %s %s", summary["name"], warning)
 
     async def reload(self) -> ReloadResult:
         async with self._reload_lock:
@@ -1063,6 +1237,10 @@ class RouterState:
                             "configured_model": provider.configured_model,
                             "anthropic_role": provider.anthropic_role,
                             "endpoint_type": provider.endpoint_type,
+                            "model_source": provider.model_source,
+                            "discovered_model_ids": list(provider.discovered_model_ids),
+                            "filtered_model_ids": list(provider.filtered_model_ids),
+                            "discovery_warnings": list(provider.discovery_warnings),
                             "api_base": provider.api_base,
                             "api_url": provider.api_url,
                             "models_url": provider.models_url,
@@ -1102,6 +1280,7 @@ class RouterState:
                     "port": self.port,
                     "log_level": self.log_level,
                     "default_timeout": self.default_timeout,
+                    "stream_start_timeout": self.stream_start_timeout,
                     "sticky_ttl_seconds": self.sticky_ttl_seconds,
                     "normalize_upstream_model": self.normalize_upstream_model,
                     "hot_reload": self.hot_reload,
@@ -1185,7 +1364,6 @@ if not CONFIG_PATH:
     )
 
 router_state = RouterState(os.path.expanduser(CONFIG_PATH))
-logger = logging.getLogger("uvicorn.error")
 
 
 async def watch_config_changes() -> None:
@@ -1226,9 +1404,9 @@ def log_provider_event(
 ) -> None:
     timestamp = datetime.now().strftime("%H:%M:%S")
     provider_url = provider.sort_url
-    provider_name = urlparse(provider_url).netloc or provider_url
+    provider_host = urlparse(provider_url).netloc or provider_url
     message = (
-        f"{timestamp} provider={provider_name} "
+        f"{timestamp} provider={provider.provider_name} host={provider_host} "
         f"model={provider.model_name} event={event}"
     )
     if detail:
@@ -1241,10 +1419,17 @@ async def stream_upstream(
     provider: Provider,
     endpoint: str,
     client: httpx.AsyncClient,
+    *,
+    byte_iter: AsyncIterator[bytes] | None = None,
+    initial_chunk: bytes | None = None,
 ) -> AsyncIterator[bytes]:
     completed = False
     try:
-        async for chunk in response.aiter_bytes():
+        if initial_chunk:
+            yield initial_chunk
+        if byte_iter is None:
+            byte_iter = response.aiter_bytes()
+        async for chunk in byte_iter:
             yield chunk
         completed = True
     except Exception as exc:
@@ -1327,6 +1512,34 @@ def is_valid_stream_success_content_type(content_type: str) -> bool:
     return "text/event-stream" in content_type.lower()
 
 
+async def validate_responses_stream_start(
+    byte_iter: AsyncIterator[bytes],
+    *,
+    timeout: float,
+) -> tuple[bytes | None, str | None]:
+    first_chunk: bytes | None = None
+    try:
+        async with asyncio.timeout(timeout):
+            async for chunk in byte_iter:
+                if chunk:
+                    first_chunk = chunk
+                    break
+    except TimeoutError:
+        return None, f"Responses stream did not start within {timeout:g}s"
+    if first_chunk is None:
+        return None, "Responses stream ended before first event"
+
+    chunk_text = first_chunk.decode("utf-8", errors="replace")
+    error_message = _extract_sse_error_message(chunk_text)
+    if error_message is not None:
+        return first_chunk, f"Responses stream error event: {error_message}"
+
+    if _extract_responses_json_from_sse_text(chunk_text) is not None:
+        return first_chunk, None
+
+    return first_chunk, None
+
+
 def parse_upstream_success_body(
     body: bytes,
     *,
@@ -1403,10 +1616,11 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                         json=upstream_payload,
                         timeout=timeout,
                     )
-                    response = await client.send(
-                        upstream_request,
-                        stream=True,
-                    )
+                    async with asyncio.timeout(router_state.stream_start_timeout):
+                        response = await client.send(
+                            upstream_request,
+                            stream=True,
+                        )
                 else:
                     response = await client.post(
                         url,
@@ -1531,10 +1745,63 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                     )
                     continue
 
+                initial_chunk: bytes | None = None
+                byte_iter: AsyncIterator[bytes] | None = None
+                if endpoint == "/responses":
+                    byte_iter = response.aiter_bytes()
+                    initial_chunk, stream_error = (
+                        await validate_responses_stream_start(
+                            byte_iter,
+                            timeout=router_state.stream_start_timeout,
+                        )
+                    )
+                    if stream_error is not None:
+                        await response.aclose()
+                        decision = FailureDecision(
+                            failure_class=FailureClass.AVAILABILITY,
+                            should_fallback=True,
+                            count_failure=True,
+                        )
+                        log_provider_event(
+                            "failure",
+                            provider,
+                            f"endpoint={endpoint} error={stream_error}",
+                        )
+                        await router_state.record_failure(
+                            provider=provider,
+                            endpoint=endpoint,
+                            error_message=stream_error,
+                            decision=decision,
+                        )
+                        await router_state.clear_session_binding(sticky_key, provider)
+                        attempts.append(
+                            {
+                                **provider_attempt_dict(provider, url),
+                                "timeout": str(timeout),
+                                "status": "stream_error_event",
+                                "failure_class": decision.failure_class,
+                                "counted": decision.count_failure,
+                                "should_fallback": decision.should_fallback,
+                                "content_type": content_type,
+                                "body_preview": (initial_chunk or b"")[:500].decode(
+                                    "utf-8",
+                                    errors="replace",
+                                ),
+                            }
+                        )
+                        continue
+
                 await router_state.bind_session(sticky_key, provider)
                 streaming_response = True
                 return StreamingResponse(
-                    stream_upstream(response, provider, endpoint, client),
+                    stream_upstream(
+                        response,
+                        provider,
+                        endpoint,
+                        client,
+                        byte_iter=byte_iter,
+                        initial_chunk=initial_chunk,
+                    ),
                     status_code=response.status_code,
                     media_type=content_type,
                     headers=provider_response_headers(provider, url),
