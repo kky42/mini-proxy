@@ -119,7 +119,12 @@ providers:
 `providers[*]`
 
 - `name`: optional provider label shown in debug/model output.
-- `api_base`: upstream base URL.
+- `api_base`: provider service root. MiniProxy builds the upstream request URL
+  from this value and `endpoint_type`. If it already ends in `/v1`, MiniProxy
+  appends the endpoint path directly; otherwise it inserts `/v1` first.
+- `api_url`: optional exact upstream request URL. When set, MiniProxy sends
+  requests to this URL exactly and does not append any endpoint path. This
+  requires `endpoint_type`.
 - `api_key`: upstream API key.
 - `endpoint_type`: optional endpoint family. Values are `responses`, `openai-compatible`, or `anthropic`.
   When set, the provider is only used for that local endpoint family.
@@ -127,7 +132,11 @@ providers:
 - `timeout`: optional provider-specific timeout in seconds.
 - `headers`: optional extra headers sent on every request to that upstream.
 - `models`: non-empty list of models this provider supports, or `auto`.
-- `models_url`: optional override for `models: auto` discovery.
+- `models_url`: optional exact URL for `models: auto` discovery.
+
+Most providers only need `api_base`, `api_key`, `endpoint_type`, `order`, and
+`models`. Use `api_url` only for providers with a nonstandard request URL, and
+use `models_url` only when model discovery is hosted somewhere different.
 
 `models: auto`
 
@@ -145,6 +154,18 @@ providers:
 By default, discovery calls `{api_base}/models` when `api_base` already ends with `/v1`; otherwise it calls `{api_base}/v1/models`. Set `models_url` if a provider exposes model discovery somewhere else.
 
 For `endpoint_type: anthropic`, discovery uses Anthropic-style headers: `x-api-key` and `anthropic-version`. Other endpoint types use OpenAI-style bearer auth. If the provider's model response includes `supported_endpoint_types`, the proxy filters discovered models to the configured `endpoint_type`.
+
+`models: auto` discovery never uses `api_url` as a fallback because `api_url`
+can point at an exact request endpoint. If `models` is `auto`, configure either
+`api_base` or `models_url`.
+
+Allowed URL combinations:
+
+- `api_base`: infer both request URL and model discovery URL.
+- `api_base` + `api_url`: send requests to `api_url`, discover models from `api_base`.
+- `api_base` + `models_url`: infer request URL from `api_base`, discover models from `models_url`.
+- `api_url` + `models_url`: send requests to `api_url`, discover models from `models_url`.
+- `api_url` only: allowed only when `models` is an explicit list.
 
 `providers[*].models[*]`
 
@@ -206,8 +227,9 @@ models:
 - For a requested model, the proxy tries only providers whose `models` list includes that model, ordered by lowest `order` first.
 - `endpoint_type` restricts a provider to one local route family: `responses` for `/v1/responses`, `openai-compatible` for `/v1/chat/completions`, and `anthropic` for `/v1/messages`.
 - Local OpenAI-style clients may use either `http://127.0.0.1:PORT/v1` or `http://127.0.0.1:PORT` as the base URL. Claude Code should use `http://127.0.0.1:PORT` as `ANTHROPIC_BASE_URL`.
-- Upstream OpenAI-style provider bases may be configured with or without `/v1`; the proxy adds `/v1` for `/responses` and `/chat/completions` when needed.
-- Upstream Anthropic provider bases should be the provider's documented Anthropic base, such as `https://api.deepseek.com/anthropic`; the proxy appends `/messages`.
+- Upstream provider bases may be configured with or without `/v1`; for example `https://ai.songsongcard.shop` plus `endpoint_type: responses` routes to `https://ai.songsongcard.shop/v1/responses`.
+- Upstream Anthropic provider bases should be the provider's documented Anthropic base, such as `https://api.deepseek.com/anthropic`; the proxy routes messages to `https://api.deepseek.com/anthropic/v1/messages`.
+- `api_url` bypasses URL inference and is used exactly as configured.
 - For `/v1/messages`, `:haiku`, `:sonnet`, and `:opus` model suffixes expose Claude Code-safe aliases: `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, and `claude-opus-4-7`.
 - If Claude Code sends a newer role model id that contains `haiku`, `sonnet`, or `opus`, the proxy can still route it to providers configured with the matching role suffix.
 - Claude Code's `[1M]` suffix is accepted for routing, then stripped before matching. For example, `claude-opus-4-7[1M]` routes as `claude-opus-4-7`.

@@ -133,6 +133,20 @@ def _coerce_headers(value: Any) -> dict[str, str]:
     return {str(key): str(header_value) for key, header_value in value.items()}
 
 
+def _coerce_optional_url(value: Any) -> str | None:
+    if value is None:
+        return None
+    url = str(value).strip()
+    return url or None
+
+
+def _coerce_optional_api_base(value: Any) -> str | None:
+    url = _coerce_optional_url(value)
+    if url is None:
+        return None
+    return url.rstrip("/")
+
+
 def _coerce_endpoint_type(value: Any, *, context: str) -> str | None:
     if value is None:
         return None
@@ -164,6 +178,17 @@ def _endpoint_type_supports_endpoint(endpoint_type: str | None, endpoint: str) -
     if endpoint_type == "openai-compatible":
         return endpoint == "/chat/completions"
     return False
+
+
+def _append_v1_endpoint(api_base: str, endpoint: str) -> str:
+    base = api_base.rstrip("/")
+    if base.endswith("/v1"):
+        return f"{base}{endpoint}"
+    return f"{base}/v1{endpoint}"
+
+
+def _infer_models_url(api_base: str) -> str:
+    return _append_v1_endpoint(api_base, "/models")
 
 
 def _safe_json_loads(body: bytes) -> dict[str, Any] | None:
@@ -428,7 +453,9 @@ class Provider:
     upstream_model: str
     anthropic_role: str | None
     endpoint_type: str | None
-    api_base: str
+    api_base: str | None
+    api_url: str | None
+    models_url: str | None
     api_key: str
     order: int
     timeout: float | None
@@ -436,7 +463,12 @@ class Provider:
 
     @property
     def provider_id(self) -> str:
-        return f"{self.model_name}|{self.order}|{self.api_base}|{self.upstream_model}"
+        route_url = self.api_url or self.api_base or ""
+        return f"{self.model_name}|{self.order}|{route_url}|{self.upstream_model}"
+
+    @property
+    def sort_url(self) -> str:
+        return self.api_url or self.api_base or ""
 
 
 @dataclass(frozen=True)
@@ -467,6 +499,46 @@ def build_failure_key(provider: Provider, endpoint: str) -> str:
 
 def build_sticky_key(session_key: str, endpoint: str, model_name: str) -> str:
     return f"{session_key}|{endpoint}|{model_name}"
+
+
+def provider_debug_dict(provider: Provider) -> dict[str, Any]:
+    return {
+        "provider_name": provider.provider_name,
+        "order": provider.order,
+        "api_base": provider.api_base,
+        "api_url": provider.api_url,
+        "models_url": provider.models_url,
+        "configured_model": provider.configured_model,
+        "upstream_model": provider.upstream_model,
+        "anthropic_role": provider.anthropic_role,
+        "endpoint_type": provider.endpoint_type,
+        "upstream_urls": {
+            "/responses": build_upstream_url(provider, "/responses"),
+            "/chat/completions": build_upstream_url(provider, "/chat/completions"),
+            "/messages": build_upstream_url(provider, "/messages"),
+        },
+    }
+
+
+def provider_attempt_dict(provider: Provider, url: str) -> dict[str, Any]:
+    return {
+        "provider_id": provider.provider_id,
+        "api_base": provider.api_base,
+        "api_url": provider.api_url,
+        "upstream_url": url,
+    }
+
+
+def provider_response_headers(provider: Provider, url: str) -> dict[str, str]:
+    headers = {
+        "x-fallback-provider-id": provider.provider_id,
+        "x-fallback-upstream-url": url,
+    }
+    if provider.api_base is not None:
+        headers["x-fallback-api-base"] = provider.api_base
+    if provider.api_url is not None:
+        headers["x-fallback-api-url"] = provider.api_url
+    return headers
 
 
 class RouterState:
@@ -515,7 +587,9 @@ class RouterState:
             upstream_model=upstream_model,
             anthropic_role=anthropic_role,
             endpoint_type=endpoint_type,
-            api_base=str(provider_params["api_base"]).rstrip("/"),
+            api_base=_coerce_optional_api_base(provider_params.get("api_base")),
+            api_url=_coerce_optional_url(provider_params.get("api_url")),
+            models_url=_coerce_optional_url(provider_params.get("models_url")),
             api_key=provider_params["api_key"],
             order=int(provider_params.get("order", 100)),
             timeout=_coerce_optional_timeout(provider_params.get("timeout")),
@@ -592,14 +666,14 @@ class RouterState:
         return model_name, configured_model, anthropic_role
 
     def _models_url(self, provider_params: dict[str, Any]) -> str:
-        configured_url = provider_params.get("models_url")
+        configured_url = _coerce_optional_url(provider_params.get("models_url"))
         if configured_url is not None:
-            return str(configured_url)
+            return configured_url
 
-        api_base = str(provider_params["api_base"]).rstrip("/")
-        if api_base.endswith("/v1"):
-            return f"{api_base}/models"
-        return f"{api_base}/v1/models"
+        api_base = _coerce_optional_api_base(provider_params.get("api_base"))
+        if api_base is None:
+            raise ValueError("models auto discovery requires api_base or models_url")
+        return _infer_models_url(api_base)
 
     def _load_auto_models(
         self,
@@ -681,16 +755,24 @@ class RouterState:
             if not isinstance(provider_params, dict):
                 raise ValueError(f"providers[{provider_index}] must be a mapping")
 
-            for required_key in ("api_base", "api_key"):
-                if required_key not in provider_params:
-                    raise ValueError(
-                        f"providers[{provider_index}].{required_key} is required"
-                    )
+            if "api_key" not in provider_params:
+                raise ValueError(f"providers[{provider_index}].api_key is required")
+            api_base = _coerce_optional_api_base(provider_params.get("api_base"))
+            api_url = _coerce_optional_url(provider_params.get("api_url"))
+            if api_base is None and api_url is None:
+                raise ValueError(
+                    f"providers[{provider_index}] must include api_base or api_url"
+                )
 
             endpoint_type = _coerce_endpoint_type(
                 provider_params.get("endpoint_type"),
                 context=f"providers[{provider_index}].endpoint_type",
             )
+            if api_url is not None and endpoint_type is None:
+                raise ValueError(
+                    f"providers[{provider_index}].endpoint_type is required when "
+                    "api_url is set"
+                )
             models = provider_params.get("models")
             if isinstance(models, str) and models.strip().lower() == "auto":
                 models = self._load_auto_models(
@@ -730,7 +812,7 @@ class RouterState:
                 grouped.setdefault(model_name, []).append(provider)
 
         return {
-            model: sorted(providers, key=lambda p: (p.order, p.api_base, p.upstream_model))
+            model: sorted(providers, key=lambda p: (p.order, p.sort_url, p.upstream_model))
             for model, providers in grouped.items()
         }
 
@@ -862,7 +944,7 @@ class RouterState:
                     )
             providers = sorted(
                 providers,
-                key=lambda provider: (provider.order, provider.api_base, provider.upstream_model),
+                key=lambda provider: (provider.order, provider.sort_url, provider.upstream_model),
             )
             if not providers:
                 raise KeyError(model_name)
@@ -980,6 +1062,16 @@ class RouterState:
                             "anthropic_role": provider.anthropic_role,
                             "endpoint_type": provider.endpoint_type,
                             "api_base": provider.api_base,
+                            "api_url": provider.api_url,
+                            "models_url": provider.models_url,
+                            "upstream_urls": {
+                                "/responses": build_upstream_url(provider, "/responses"),
+                                "/chat/completions": build_upstream_url(
+                                    provider,
+                                    "/chat/completions",
+                                ),
+                                "/messages": build_upstream_url(provider, "/messages"),
+                            },
                             "order": provider.order,
                             "timeout": provider.timeout,
                             "extra_headers": provider.extra_headers,
@@ -1055,15 +1147,7 @@ class RouterState:
                         "root": primary.configured_model,
                         "parent": None,
                         "providers": [
-                            {
-                                "provider_name": provider.provider_name,
-                                "order": provider.order,
-                                "api_base": provider.api_base,
-                                "configured_model": provider.configured_model,
-                                "upstream_model": provider.upstream_model,
-                                "anthropic_role": provider.anthropic_role,
-                                "endpoint_type": provider.endpoint_type,
-                            }
+                            provider_debug_dict(provider)
                             for provider in providers
                         ],
                     }
@@ -1086,15 +1170,7 @@ class RouterState:
                 "root": primary.configured_model,
                 "parent": None,
                 "providers": [
-                    {
-                        "provider_name": provider.provider_name,
-                        "order": provider.order,
-                        "api_base": provider.api_base,
-                        "configured_model": provider.configured_model,
-                        "upstream_model": provider.upstream_model,
-                        "anthropic_role": provider.anthropic_role,
-                        "endpoint_type": provider.endpoint_type,
-                    }
+                    provider_debug_dict(provider)
                     for provider in providers
                 ],
             }
@@ -1147,7 +1223,8 @@ def log_provider_event(
     detail: str = "",
 ) -> None:
     timestamp = datetime.now().strftime("%H:%M:%S")
-    provider_name = urlparse(provider.api_base).netloc or provider.api_base
+    provider_url = provider.sort_url
+    provider_name = urlparse(provider_url).netloc or provider_url
     message = (
         f"{timestamp} provider={provider_name} "
         f"model={provider.model_name} event={event}"
@@ -1237,14 +1314,11 @@ def build_upstream_headers(request: Request, provider: Provider, endpoint: str) 
 
 
 def build_upstream_url(provider: Provider, endpoint: str) -> str:
-    api_base = provider.api_base.rstrip("/")
-    parsed_base = urlparse(api_base)
-    base_path = parsed_base.path.rstrip("/")
-    if endpoint in {"/responses", "/chat/completions"} and not api_base.endswith("/v1"):
-        api_base = f"{api_base}/v1"
-    elif endpoint == "/messages" and not base_path:
-        api_base = f"{api_base}/v1"
-    return f"{api_base}{endpoint}"
+    if provider.api_url is not None:
+        return provider.api_url
+    if provider.api_base is None:
+        raise ValueError("Provider must include api_base or api_url")
+    return _append_v1_endpoint(provider.api_base, endpoint)
 
 
 def is_valid_stream_success_content_type(content_type: str) -> bool:
@@ -1356,8 +1430,7 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                     await router_state.clear_session_binding(sticky_key, provider)
                 attempts.append(
                     {
-                        "provider_id": provider.provider_id,
-                        "api_base": provider.api_base,
+                        **provider_attempt_dict(provider, url),
                         "timeout": str(timeout),
                         "status": "transport_error",
                         "failure_class": decision.failure_class,
@@ -1395,8 +1468,7 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                     await router_state.clear_session_binding(sticky_key, provider)
                 attempts.append(
                     {
-                        "provider_id": provider.provider_id,
-                        "api_base": provider.api_base,
+                        **provider_attempt_dict(provider, url),
                         "timeout": str(timeout),
                         "status": "http_error",
                         "http_status": response.status_code,
@@ -1445,8 +1517,7 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                     )
                     attempts.append(
                         {
-                            "provider_id": provider.provider_id,
-                            "api_base": provider.api_base,
+                            **provider_attempt_dict(provider, url),
                             "timeout": str(timeout),
                             "status": "invalid_stream_response",
                             "failure_class": decision.failure_class,
@@ -1459,16 +1530,12 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                     continue
 
                 await router_state.bind_session(sticky_key, provider)
-                headers = {
-                    "x-fallback-provider-id": provider.provider_id,
-                    "x-fallback-api-base": provider.api_base,
-                }
                 streaming_response = True
                 return StreamingResponse(
                     stream_upstream(response, provider, endpoint, client),
                     status_code=response.status_code,
                     media_type=content_type,
-                    headers=headers,
+                    headers=provider_response_headers(provider, url),
                 )
 
             body = await response.aread()
@@ -1501,8 +1568,7 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                 )
                 attempts.append(
                     {
-                        "provider_id": provider.provider_id,
-                        "api_base": provider.api_base,
+                        **provider_attempt_dict(provider, url),
                         "timeout": str(timeout),
                         "status": "invalid_success_response",
                         "failure_class": decision.failure_class,
@@ -1522,8 +1588,7 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                 content=parsed,
                 status_code=response.status_code,
                 headers={
-                    "x-fallback-provider-id": provider.provider_id,
-                    "x-fallback-api-base": provider.api_base,
+                    **provider_response_headers(provider, url),
                     "x-fallback-order": str(provider.order),
                 },
             )

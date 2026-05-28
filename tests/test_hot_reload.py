@@ -461,6 +461,8 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             anthropic_role=None,
             endpoint_type="responses",
             api_base="https://responses.example",
+            api_url=None,
+            models_url=None,
             api_key="sk-responses",
             order=1,
             timeout=None,
@@ -474,6 +476,8 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             anthropic_role=None,
             endpoint_type="openai-compatible",
             api_base="https://chat.example",
+            api_url=None,
+            models_url=None,
             api_key="sk-chat",
             order=1,
             timeout=None,
@@ -487,6 +491,8 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             anthropic_role="opus",
             endpoint_type="anthropic",
             api_base="https://anthropic.example/anthropic",
+            api_url=None,
+            models_url=None,
             api_key="sk-anthropic",
             order=1,
             timeout=None,
@@ -500,6 +506,8 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             anthropic_role="opus",
             endpoint_type="anthropic",
             api_base="https://anthropic-host.example",
+            api_url=None,
+            models_url=None,
             api_key="sk-anthropic",
             order=1,
             timeout=None,
@@ -516,12 +524,183 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             app_module.build_upstream_url(anthropic_provider, "/messages"),
-            "https://anthropic.example/anthropic/messages",
+            "https://anthropic.example/anthropic/v1/messages",
         )
         self.assertEqual(
             app_module.build_upstream_url(anthropic_host_provider, "/messages"),
             "https://anthropic-host.example/v1/messages",
         )
+
+    async def test_api_url_exactly_overrides_inferred_request_url(self) -> None:
+        provider = app_module.Provider(
+            provider_name="custom",
+            model_name="gpt-5.5",
+            configured_model="gpt-5.4-mini",
+            upstream_model="gpt-5.4-mini",
+            anthropic_role=None,
+            endpoint_type="responses",
+            api_base="https://base.example",
+            api_url="https://custom.example/respond",
+            models_url=None,
+            api_key="sk-custom",
+            order=1,
+            timeout=None,
+            extra_headers={},
+        )
+
+        self.assertEqual(
+            app_module.build_upstream_url(provider, "/responses"),
+            "https://custom.example/respond",
+        )
+
+    async def test_api_url_preserves_exact_configured_url(self) -> None:
+        provider = app_module.Provider(
+            provider_name="custom",
+            model_name="gpt-5.5",
+            configured_model="gpt-5.4-mini",
+            upstream_model="gpt-5.4-mini",
+            anthropic_role=None,
+            endpoint_type="responses",
+            api_base=None,
+            api_url="https://custom.example/respond/",
+            models_url=None,
+            api_key="sk-custom",
+            order=1,
+            timeout=None,
+            extra_headers={},
+        )
+
+        self.assertEqual(
+            app_module.build_upstream_url(provider, "/responses"),
+            "https://custom.example/respond/",
+        )
+
+    async def test_auto_models_with_api_base_and_api_url_discovers_from_api_base(
+        self,
+    ) -> None:
+        data: dict[str, Any] = {
+            "providers": [
+                {
+                    "name": "custom-request",
+                    "api_base": "https://models.example",
+                    "api_url": "https://custom.example/respond",
+                    "api_key": "sk-custom",
+                    "order": 1,
+                    "endpoint_type": "responses",
+                    "models": "auto",
+                }
+            ]
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        captured: list[dict[str, Any]] = []
+
+        def fake_get(url: str, **kwargs: Any) -> httpx.Response:
+            captured.append({"url": url, **kwargs})
+            return httpx.Response(
+                200,
+                json={"object": "list", "data": [{"id": "gpt-auto", "object": "model"}]},
+            )
+
+        original_get = app_module.httpx.get
+        app_module.httpx.get = fake_get
+        try:
+            self.state = app_module.RouterState(str(self.config_path))
+        finally:
+            app_module.httpx.get = original_get
+
+        candidates = await self.state.get_candidate_providers(
+            "gpt-auto",
+            "/responses",
+            sticky_key=None,
+        )
+
+        self.assertEqual(captured[0]["url"], "https://models.example/v1/models")
+        self.assertEqual(
+            app_module.build_upstream_url(candidates[0], "/responses"),
+            "https://custom.example/respond",
+        )
+
+    async def test_auto_models_with_api_url_and_models_url_uses_models_url(self) -> None:
+        data: dict[str, Any] = {
+            "providers": [
+                {
+                    "name": "custom-only",
+                    "api_url": "https://custom.example/respond",
+                    "models_url": "https://custom.example/list-models/",
+                    "api_key": "sk-custom",
+                    "order": 1,
+                    "endpoint_type": "responses",
+                    "models": "auto",
+                }
+            ]
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        captured: list[dict[str, Any]] = []
+
+        def fake_get(url: str, **kwargs: Any) -> httpx.Response:
+            captured.append({"url": url, **kwargs})
+            return httpx.Response(
+                200,
+                json={"object": "list", "data": [{"id": "gpt-auto", "object": "model"}]},
+            )
+
+        original_get = app_module.httpx.get
+        app_module.httpx.get = fake_get
+        try:
+            self.state = app_module.RouterState(str(self.config_path))
+        finally:
+            app_module.httpx.get = original_get
+
+        self.assertEqual(captured[0]["url"], "https://custom.example/list-models/")
+
+    async def test_auto_models_with_api_url_only_is_rejected(self) -> None:
+        self.config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "providers": [
+                        {
+                            "name": "custom-only",
+                            "api_url": "https://custom.example/respond",
+                            "api_key": "sk-custom",
+                            "order": 1,
+                            "endpoint_type": "responses",
+                            "models": "auto",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "models auto discovery requires api_base or models_url",
+        ):
+            app_module.RouterState(str(self.config_path))
+
+    async def test_api_url_requires_endpoint_type(self) -> None:
+        self.config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "providers": [
+                        {
+                            "name": "custom-only",
+                            "api_url": "https://custom.example/respond",
+                            "api_key": "sk-custom",
+                            "order": 1,
+                            "models": ["gpt-custom"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"providers\[0\]\.endpoint_type is required when api_url is set",
+        ):
+            app_module.RouterState(str(self.config_path))
 
     async def test_anthropic_exact_model_and_role_suffix_share_candidates(self) -> None:
         data: dict[str, Any] = {
