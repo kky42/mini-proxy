@@ -8,6 +8,8 @@ app_settings:
 router_settings:
   allowed_fails: 1
   cooldown_time: 300
+  allowed_retries: 0
+  retry_backoff_seconds: 0.25
 
 providers:
   - name: jucode

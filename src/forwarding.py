@@ -191,6 +191,19 @@ def parse_upstream_success_body(
     return None, f"Unexpected success content-type: {content_type or '<missing>'}"
 
 
+def should_retry_provider_failure(
+    decision: FailureDecision,
+    *,
+    retry_index: int,
+    allowed_retries: int,
+) -> bool:
+    return (
+        retry_index < allowed_retries
+        and decision.should_fallback
+        and decision.failure_class == FailureClass.AVAILABILITY
+    )
+
+
 async def forward_request(request: Request, endpoint: str) -> Any:
     try:
         payload = await request.json()
@@ -215,6 +228,8 @@ async def forward_request(request: Request, endpoint: str) -> Any:
     stream = bool(payload.get("stream"))
     attempts: list[dict[str, Any]] = []
     total_provider_count = len(candidates)
+    allowed_retries = _g.router_state.allowed_retries
+    retry_backoff_seconds = _g.router_state.retry_backoff_seconds
 
     client = httpx.AsyncClient(follow_redirects=True)
     streaming_response = False
@@ -225,129 +240,275 @@ async def forward_request(request: Request, endpoint: str) -> Any:
             upstream_payload["model"] = provider.upstream_model
             url = build_upstream_url(provider, endpoint)
             headers = build_upstream_headers(request, provider, endpoint)
-            log_provider_event(
-                "attempt",
-                provider,
-                f"endpoint={endpoint} stream={str(stream).lower()}",
-            )
 
-            try:
-                if stream:
-                    upstream_request = client.build_request(
-                        "POST",
-                        url,
-                        headers=headers,
-                        json=upstream_payload,
-                        timeout=timeout,
-                    )
-                    async with asyncio.timeout(_g.router_state.stream_start_timeout):
-                        response = await client.send(
-                            upstream_request,
-                            stream=True,
-                        )
-                else:
-                    response = await client.post(
-                        url,
-                        headers=headers,
-                        json=upstream_payload,
-                        timeout=timeout,
-                    )
-            except Exception as exc:
-                error_message = f"{exc.__class__.__name__}: {exc}"
-                decision = classify_transport_error(exc)
-                log_provider_event(
-                    "failure",
-                    provider,
-                    f"endpoint={endpoint} error={error_message}",
-                )
-                await _g.router_state.record_failure(
-                    provider=provider,
-                    endpoint=endpoint,
-                    error_message=error_message,
-                    decision=decision,
-                )
-                if decision.count_failure:
-                    await _g.router_state.clear_session_binding(sticky_key, provider)
-                attempts.append(
-                    {
-                        **provider_attempt_dict(provider, url),
-                        "timeout": str(timeout),
-                        "status": "transport_error",
-                        "failure_class": decision.failure_class,
-                        "counted": decision.count_failure,
-                        "error": error_message,
-                    }
-                )
-                if decision.should_fallback:
-                    continue
-                raise HTTPException(status_code=503, detail={"message": error_message})
-
-            if response.status_code >= 400:
-                body = await response.aread()
-                decision = classify_http_error(
-                    status_code=response.status_code,
-                    body=body,
-                    endpoint=endpoint,
+            for retry_index in range(allowed_retries + 1):
+                retry_detail = (
+                    f" retry={retry_index}/{allowed_retries}"
+                    if allowed_retries
+                    else ""
                 )
                 log_provider_event(
-                    "failure",
+                    "attempt",
                     provider,
-                    f"endpoint={endpoint} status={response.status_code}",
+                    f"endpoint={endpoint} stream={str(stream).lower()}{retry_detail}",
                 )
-                error_message = (
-                    f"HTTP {response.status_code}: "
-                    f"{body[:500].decode('utf-8', errors='replace')}"
-                )
-                await _g.router_state.record_failure(
-                    provider=provider,
-                    endpoint=endpoint,
-                    error_message=error_message,
-                    decision=decision,
-                )
-                if decision.count_failure:
-                    await _g.router_state.clear_session_binding(sticky_key, provider)
-                attempts.append(
-                    {
-                        **provider_attempt_dict(provider, url),
-                        "timeout": str(timeout),
-                        "status": "http_error",
-                        "http_status": response.status_code,
-                        "failure_class": decision.failure_class,
-                        "counted": decision.count_failure,
-                        "should_fallback": decision.should_fallback,
-                        "body_preview": body[:500].decode("utf-8", errors="replace"),
-                    }
-                )
-                await response.aclose()
-                if decision.should_fallback:
-                    continue
-                parsed_detail: Any
+
                 try:
-                    parsed_detail = json.loads(body)
-                except Exception:
-                    parsed_detail = {"message": body.decode("utf-8", errors="replace")}
-                return JSONResponse(content=parsed_detail, status_code=response.status_code)
+                    if stream:
+                        upstream_request = client.build_request(
+                            "POST",
+                            url,
+                            headers=headers,
+                            json=upstream_payload,
+                            timeout=timeout,
+                        )
+                        async with asyncio.timeout(_g.router_state.stream_start_timeout):
+                            response = await client.send(
+                                upstream_request,
+                                stream=True,
+                            )
+                    else:
+                        response = await client.post(
+                            url,
+                            headers=headers,
+                            json=upstream_payload,
+                            timeout=timeout,
+                        )
+                except Exception as exc:
+                    error_message = f"{exc.__class__.__name__}: {exc}"
+                    decision = classify_transport_error(exc)
+                    log_provider_event(
+                        "failure",
+                        provider,
+                        f"endpoint={endpoint} error={error_message}",
+                    )
+                    retryable = should_retry_provider_failure(
+                        decision,
+                        retry_index=retry_index,
+                        allowed_retries=allowed_retries,
+                    )
+                    if retryable:
+                        if retry_backoff_seconds:
+                            await asyncio.sleep(retry_backoff_seconds)
+                        continue
+                    await _g.router_state.record_failure(
+                        provider=provider,
+                        endpoint=endpoint,
+                        error_message=error_message,
+                        decision=decision,
+                    )
+                    if decision.count_failure:
+                        await _g.router_state.clear_session_binding(sticky_key, provider)
+                    attempts.append(
+                        {
+                            **provider_attempt_dict(provider, url),
+                            "timeout": str(timeout),
+                            "status": "transport_error",
+                            "failure_class": decision.failure_class,
+                            "counted": decision.count_failure,
+                            "retry_count": retry_index,
+                            "max_retries": allowed_retries,
+                            "error": error_message,
+                        }
+                    )
+                    if decision.should_fallback:
+                        break
+                    raise HTTPException(status_code=503, detail={"message": error_message})
 
-            if stream:
-                content_type = response.headers.get("content-type", "")
-                if not is_valid_stream_success_content_type(content_type):
+                if response.status_code >= 400:
                     body = await response.aread()
+                    decision = classify_http_error(
+                        status_code=response.status_code,
+                        body=body,
+                        endpoint=endpoint,
+                    )
+                    log_provider_event(
+                        "failure",
+                        provider,
+                        f"endpoint={endpoint} status={response.status_code}",
+                    )
+                    error_message = (
+                        f"HTTP {response.status_code}: "
+                        f"{body[:500].decode('utf-8', errors='replace')}"
+                    )
                     await response.aclose()
+                    retryable = should_retry_provider_failure(
+                        decision,
+                        retry_index=retry_index,
+                        allowed_retries=allowed_retries,
+                    )
+                    if retryable:
+                        if retry_backoff_seconds:
+                            await asyncio.sleep(retry_backoff_seconds)
+                        continue
+                    await _g.router_state.record_failure(
+                        provider=provider,
+                        endpoint=endpoint,
+                        error_message=error_message,
+                        decision=decision,
+                    )
+                    if decision.count_failure:
+                        await _g.router_state.clear_session_binding(sticky_key, provider)
+                    attempts.append(
+                        {
+                            **provider_attempt_dict(provider, url),
+                            "timeout": str(timeout),
+                            "status": "http_error",
+                            "http_status": response.status_code,
+                            "failure_class": decision.failure_class,
+                            "counted": decision.count_failure,
+                            "should_fallback": decision.should_fallback,
+                            "retry_count": retry_index,
+                            "max_retries": allowed_retries,
+                            "body_preview": body[:500].decode("utf-8", errors="replace"),
+                        }
+                    )
+                    if decision.should_fallback:
+                        break
+                    parsed_detail: Any
+                    try:
+                        parsed_detail = json.loads(body)
+                    except Exception:
+                        parsed_detail = {"message": body.decode("utf-8", errors="replace")}
+                    return JSONResponse(content=parsed_detail, status_code=response.status_code)
+
+                if stream:
+                    content_type = response.headers.get("content-type", "")
+                    if not is_valid_stream_success_content_type(content_type):
+                        body = await response.aread()
+                        await response.aclose()
+                        decision = FailureDecision(
+                            failure_class=FailureClass.CAPABILITY_MISMATCH,
+                            should_fallback=True,
+                            count_failure=False,
+                        )
+                        error_message = (
+                            f"Unexpected stream content-type: "
+                            f"{content_type or '<missing>'}: "
+                            f"{body[:500].decode('utf-8', errors='replace')}"
+                        )
+                        log_provider_event(
+                            "failure",
+                            provider,
+                            f"endpoint={endpoint} error=Unexpected stream content-type: "
+                            f"{content_type or '<missing>'}",
+                        )
+                        await _g.router_state.record_failure(
+                            provider=provider,
+                            endpoint=endpoint,
+                            error_message=error_message,
+                            decision=decision,
+                        )
+                        attempts.append(
+                            {
+                                **provider_attempt_dict(provider, url),
+                                "timeout": str(timeout),
+                                "status": "invalid_stream_response",
+                                "failure_class": decision.failure_class,
+                                "counted": decision.count_failure,
+                                "should_fallback": decision.should_fallback,
+                                "retry_count": retry_index,
+                                "max_retries": allowed_retries,
+                                "content_type": content_type,
+                                "body_preview": body[:500].decode("utf-8", errors="replace"),
+                            }
+                        )
+                        break
+
+                    initial_chunk: bytes | None = None
+                    byte_iter: AsyncIterator[bytes] | None = None
+                    if endpoint == "/responses":
+                        byte_iter = response.aiter_bytes()
+                        initial_chunk, stream_error = (
+                            await validate_responses_stream_start(
+                                byte_iter,
+                                timeout=_g.router_state.stream_start_timeout,
+                            )
+                        )
+                        if stream_error is not None:
+                            await response.aclose()
+                            decision = FailureDecision(
+                                failure_class=FailureClass.AVAILABILITY,
+                                should_fallback=True,
+                                count_failure=True,
+                            )
+                            log_provider_event(
+                                "failure",
+                                provider,
+                                f"endpoint={endpoint} error={stream_error}",
+                            )
+                            retryable = should_retry_provider_failure(
+                                decision,
+                                retry_index=retry_index,
+                                allowed_retries=allowed_retries,
+                            )
+                            if retryable:
+                                if retry_backoff_seconds:
+                                    await asyncio.sleep(retry_backoff_seconds)
+                                continue
+                            await _g.router_state.record_failure(
+                                provider=provider,
+                                endpoint=endpoint,
+                                error_message=stream_error,
+                                decision=decision,
+                            )
+                            await _g.router_state.clear_session_binding(sticky_key, provider)
+                            attempts.append(
+                                {
+                                    **provider_attempt_dict(provider, url),
+                                    "timeout": str(timeout),
+                                    "status": "stream_error_event",
+                                    "failure_class": decision.failure_class,
+                                    "counted": decision.count_failure,
+                                    "should_fallback": decision.should_fallback,
+                                    "retry_count": retry_index,
+                                    "max_retries": allowed_retries,
+                                    "content_type": content_type,
+                                    "body_preview": (initial_chunk or b"")[:500].decode(
+                                        "utf-8",
+                                        errors="replace",
+                                    ),
+                                }
+                            )
+                            break
+
+                    await _g.router_state.bind_session(sticky_key, provider)
+                    streaming_response = True
+                    return StreamingResponse(
+                        stream_upstream(
+                            response,
+                            provider,
+                            endpoint,
+                            client,
+                            byte_iter=byte_iter,
+                            initial_chunk=initial_chunk,
+                        ),
+                        status_code=response.status_code,
+                        media_type=content_type,
+                        headers=provider_response_headers(provider, url),
+                    )
+
+                body = await response.aread()
+                await response.aclose()
+                content_type = response.headers.get("content-type", "")
+                parsed, parse_error = parse_upstream_success_body(
+                    body,
+                    content_type=content_type,
+                    endpoint=endpoint,
+                )
+                if parse_error is not None:
                     decision = FailureDecision(
                         failure_class=FailureClass.CAPABILITY_MISMATCH,
                         should_fallback=True,
                         count_failure=False,
                     )
                     error_message = (
-                        f"Unexpected stream content-type: "
-                        f"{content_type or '<missing>'}: "
-                        f"{body[:500].decode('utf-8', errors='replace')}"
+                        f"{parse_error}: {body[:500].decode('utf-8', errors='replace')}"
                     )
                     log_provider_event(
                         "failure",
                         provider,
-                        f"endpoint={endpoint} error=Unexpected stream content-type: "
-                        f"{content_type or '<missing>'}",
+                        f"endpoint={endpoint} error={parse_error}",
                     )
                     await _g.router_state.record_failure(
                         provider=provider,
@@ -359,132 +520,33 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                         {
                             **provider_attempt_dict(provider, url),
                             "timeout": str(timeout),
-                            "status": "invalid_stream_response",
+                            "status": "invalid_success_response",
                             "failure_class": decision.failure_class,
                             "counted": decision.count_failure,
                             "should_fallback": decision.should_fallback,
+                            "retry_count": retry_index,
+                            "max_retries": allowed_retries,
                             "content_type": content_type,
                             "body_preview": body[:500].decode("utf-8", errors="replace"),
                         }
                     )
-                    continue
+                    break
 
-                initial_chunk: bytes | None = None
-                byte_iter: AsyncIterator[bytes] | None = None
-                if endpoint == "/responses":
-                    byte_iter = response.aiter_bytes()
-                    initial_chunk, stream_error = (
-                        await validate_responses_stream_start(
-                            byte_iter,
-                            timeout=_g.router_state.stream_start_timeout,
-                        )
-                    )
-                    if stream_error is not None:
-                        await response.aclose()
-                        decision = FailureDecision(
-                            failure_class=FailureClass.AVAILABILITY,
-                            should_fallback=True,
-                            count_failure=True,
-                        )
-                        log_provider_event(
-                            "failure",
-                            provider,
-                            f"endpoint={endpoint} error={stream_error}",
-                        )
-                        await _g.router_state.record_failure(
-                            provider=provider,
-                            endpoint=endpoint,
-                            error_message=stream_error,
-                            decision=decision,
-                        )
-                        await _g.router_state.clear_session_binding(sticky_key, provider)
-                        attempts.append(
-                            {
-                                **provider_attempt_dict(provider, url),
-                                "timeout": str(timeout),
-                                "status": "stream_error_event",
-                                "failure_class": decision.failure_class,
-                                "counted": decision.count_failure,
-                                "should_fallback": decision.should_fallback,
-                                "content_type": content_type,
-                                "body_preview": (initial_chunk or b"")[:500].decode(
-                                    "utf-8",
-                                    errors="replace",
-                                ),
-                            }
-                        )
-                        continue
-
+                await _g.router_state.record_success(provider, endpoint)
+                log_provider_event("success", provider, f"endpoint={endpoint} stream=false")
                 await _g.router_state.bind_session(sticky_key, provider)
-                streaming_response = True
-                return StreamingResponse(
-                    stream_upstream(
-                        response,
-                        provider,
-                        endpoint,
-                        client,
-                        byte_iter=byte_iter,
-                        initial_chunk=initial_chunk,
-                    ),
+
+                return JSONResponse(
+                    content=parsed,
                     status_code=response.status_code,
-                    media_type=content_type,
-                    headers=provider_response_headers(provider, url),
+                    headers={
+                        **provider_response_headers(provider, url),
+                        "x-fallback-order": str(provider.order),
+                    },
                 )
 
-            body = await response.aread()
-            await response.aclose()
-            content_type = response.headers.get("content-type", "")
-            parsed, parse_error = parse_upstream_success_body(
-                body,
-                content_type=content_type,
-                endpoint=endpoint,
-            )
-            if parse_error is not None:
-                decision = FailureDecision(
-                    failure_class=FailureClass.CAPABILITY_MISMATCH,
-                    should_fallback=True,
-                    count_failure=False,
-                )
-                error_message = (
-                    f"{parse_error}: {body[:500].decode('utf-8', errors='replace')}"
-                )
-                log_provider_event(
-                    "failure",
-                    provider,
-                    f"endpoint={endpoint} error={parse_error}",
-                )
-                await _g.router_state.record_failure(
-                    provider=provider,
-                    endpoint=endpoint,
-                    error_message=error_message,
-                    decision=decision,
-                )
-                attempts.append(
-                    {
-                        **provider_attempt_dict(provider, url),
-                        "timeout": str(timeout),
-                        "status": "invalid_success_response",
-                        "failure_class": decision.failure_class,
-                        "counted": decision.count_failure,
-                        "should_fallback": decision.should_fallback,
-                        "content_type": content_type,
-                        "body_preview": body[:500].decode("utf-8", errors="replace"),
-                    }
-                )
-                continue
-
-            await _g.router_state.record_success(provider, endpoint)
-            log_provider_event("success", provider, f"endpoint={endpoint} stream=false")
-            await _g.router_state.bind_session(sticky_key, provider)
-
-            return JSONResponse(
-                content=parsed,
-                status_code=response.status_code,
-                headers={
-                    **provider_response_headers(provider, url),
-                    "x-fallback-order": str(provider.order),
-                },
-            )
+            # Exhausted this provider or hit a non-retryable fallback case.
+            continue
 
         raise HTTPException(
             status_code=503,

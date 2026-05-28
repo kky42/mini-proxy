@@ -70,6 +70,8 @@ class RouterConfig:
     hot_reload_interval_seconds: float
     allowed_fails: int
     cooldown_time: int
+    allowed_retries: int
+    retry_backoff_seconds: float
     providers_by_model: dict[str, list[Provider]]
 
 

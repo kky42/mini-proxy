@@ -13,7 +13,9 @@ from .constants import (
     ANTHROPIC_ENDPOINTS,
     ANTHROPIC_ROLE_MODEL_ALIASES,
     ANTHROPIC_VERSION,
+    DEFAULT_ALLOWED_RETRIES,
     DEFAULT_HOT_RELOAD_INTERVAL_SECONDS,
+    DEFAULT_RETRY_BACKOFF_SECONDS,
     DEFAULT_STICKY_TTL_SECONDS,
     DEFAULT_STREAM_START_TIMEOUT,
     DEFAULT_TIMEOUT,
@@ -122,6 +124,8 @@ class RouterState:
         self._lock = asyncio.Lock()
         self.allowed_fails = 0
         self.cooldown_time = 300
+        self.allowed_retries = DEFAULT_ALLOWED_RETRIES
+        self.retry_backoff_seconds = DEFAULT_RETRY_BACKOFF_SECONDS
         self.sticky_ttl_seconds = DEFAULT_STICKY_TTL_SECONDS
         self.default_timeout = DEFAULT_TIMEOUT
         self.stream_start_timeout = DEFAULT_STREAM_START_TIMEOUT
@@ -537,6 +541,19 @@ class RouterState:
             raise ValueError("router_settings must be a mapping")
         allowed_fails = int(router_settings.get("allowed_fails", 0))
         cooldown_time = int(router_settings.get("cooldown_time", 300))
+        allowed_retries = max(
+            0,
+            int(router_settings.get("allowed_retries", DEFAULT_ALLOWED_RETRIES)),
+        )
+        retry_backoff_seconds = max(
+            0.0,
+            float(
+                router_settings.get(
+                    "retry_backoff_seconds",
+                    DEFAULT_RETRY_BACKOFF_SECONDS,
+                )
+            ),
+        )
 
         providers_by_model = await self._load_providers(
             raw,
@@ -554,6 +571,8 @@ class RouterState:
             hot_reload_interval_seconds=hot_reload_interval_seconds,
             allowed_fails=allowed_fails,
             cooldown_time=cooldown_time,
+            allowed_retries=allowed_retries,
+            retry_backoff_seconds=retry_backoff_seconds,
             providers_by_model=providers_by_model,
         )
 
@@ -569,6 +588,8 @@ class RouterState:
         self.hot_reload_interval_seconds = config.hot_reload_interval_seconds
         self.allowed_fails = config.allowed_fails
         self.cooldown_time = config.cooldown_time
+        self.allowed_retries = config.allowed_retries
+        self.retry_backoff_seconds = config.retry_backoff_seconds
         self.providers_by_model = config.providers_by_model
         self.last_reload_at = time.time()
         self.last_reload_error = None
@@ -915,6 +936,8 @@ class RouterState:
                 },
                 "allowed_fails": self.allowed_fails,
                 "cooldown_time": self.cooldown_time,
+                "allowed_retries": self.allowed_retries,
+                "retry_backoff_seconds": self.retry_backoff_seconds,
                 "session_bindings": [
                     {
                         "session_key": session_key,

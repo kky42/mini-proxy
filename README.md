@@ -116,6 +116,8 @@ providers:
 
 - `allowed_fails`: allowed failures before cooldown. Cooldown starts only when `fail_count > allowed_fails`. Default `0`.
 - `cooldown_time`: cooldown length in seconds. Default `300`.
+- `allowed_retries`: same-provider retries before falling back to the next provider. Default `0`, so existing fallback behavior is unchanged.
+- `retry_backoff_seconds`: pause between same-provider retries. Default `0.25`.
 
 `providers[*]`
 
@@ -245,6 +247,9 @@ models:
 - For an existing sticky session, the bound provider stays preferred until the sticky TTL expires or that provider has a counted failure, even if a higher-priority provider's cooldown has expired.
 - Cooldown state is tracked per `provider + endpoint + model alias`, not globally.
 - A provider enters cooldown only when its counted failure count becomes greater than `allowed_fails`.
+- `allowed_retries` applies before fallback for retryable failures. The original attempt plus `allowed_retries` attempts may be sent to the same provider.
+- An exhausted retry cycle counts as one provider failure, not one failure per upstream attempt.
+- Retries are limited to transport errors, timeouts, `408`, `429`, `5xx`, and pre-body Responses stream-start failures. Auth/balance errors such as `401`, `402`, and `403` are not retried.
 - After cooldown expires, new requests automatically go back to the higher-priority provider.
 - Request body `timeout` overrides provider timeout, which overrides `app_settings.default_timeout`.
 - For streaming requests, the selected timeout still applies to connect/write/pool, but upstream idle reads are left unbounded to avoid false reconnect loops.
