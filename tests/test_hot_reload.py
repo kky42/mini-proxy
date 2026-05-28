@@ -179,6 +179,138 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             "metadata:user_id:session_id|ec5bf141-a549-4540-835e-63af0155c8e9",
         )
 
+    def test_extract_session_key_openai_chat_fingerprint(self) -> None:
+        request = SimpleNamespace(
+            headers={},
+            client=SimpleNamespace(host="127.0.0.1"),
+        )
+
+        session_key = app_module._extract_session_key(
+            request,
+            {
+                "model": "gpt-4",
+                "messages": [
+                    {"role": "system", "content": "You are helpful."},
+                    {"role": "user", "content": "hello world"},
+                ],
+            },
+            endpoint="/chat/completions",
+        )
+
+        self.assertIsNotNone(session_key)
+        self.assertTrue(session_key.startswith("content|"))
+        self.assertEqual(len(session_key), 24)  # "content|" + 16 hex chars
+
+    def test_extract_session_key_openai_chat_fingerprint_stable(self) -> None:
+        request = SimpleNamespace(
+            headers={},
+            client=SimpleNamespace(host="127.0.0.1"),
+        )
+
+        payload = {
+            "model": "gpt-4",
+            "messages": [
+                {"role": "user", "content": "hello world"},
+            ],
+        }
+
+        key1 = app_module._extract_session_key(
+            request, payload, endpoint="/chat/completions"
+        )
+        key2 = app_module._extract_session_key(
+            request, payload, endpoint="/chat/completions"
+        )
+
+        self.assertEqual(key1, key2)
+
+    def test_extract_session_key_openai_chat_different_messages_different_fingerprints(self) -> None:
+        request = SimpleNamespace(
+            headers={},
+            client=SimpleNamespace(host="127.0.0.1"),
+        )
+
+        key1 = app_module._extract_session_key(
+            request,
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "hello"}]},
+            endpoint="/chat/completions",
+        )
+        key2 = app_module._extract_session_key(
+            request,
+            {"model": "gpt-4", "messages": [{"role": "user", "content": "world"}]},
+            endpoint="/chat/completions",
+        )
+
+        self.assertNotEqual(key1, key2)
+
+    def test_extract_session_key_openai_chat_no_messages_returns_none(self) -> None:
+        request = SimpleNamespace(
+            headers={},
+            client=SimpleNamespace(host="127.0.0.1"),
+        )
+
+        session_key = app_module._extract_session_key(
+            request,
+            {"model": "gpt-4", "messages": []},
+            endpoint="/chat/completions",
+        )
+
+        self.assertIsNone(session_key)
+
+    def test_extract_session_key_openai_chat_no_user_message_returns_none(self) -> None:
+        request = SimpleNamespace(
+            headers={},
+            client=SimpleNamespace(host="127.0.0.1"),
+        )
+
+        session_key = app_module._extract_session_key(
+            request,
+            {
+                "model": "gpt-4",
+                "messages": [
+                    {"role": "system", "content": "You are helpful."},
+                ],
+            },
+            endpoint="/chat/completions",
+        )
+
+        self.assertIsNone(session_key)
+
+    def test_extract_session_key_openai_chat_header_takes_priority(self) -> None:
+        request = SimpleNamespace(
+            headers={"x-fallback-session": "my-session-id"},
+            client=SimpleNamespace(host="127.0.0.1"),
+        )
+
+        session_key = app_module._extract_session_key(
+            request,
+            {
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            endpoint="/chat/completions",
+        )
+
+        self.assertEqual(session_key, "header|my-session-id")
+
+    def test_extract_session_key_openai_chat_streaming_preserves_sticky(self) -> None:
+        """Fingerprint works when stream=True (same as non-streaming)."""
+        request = SimpleNamespace(
+            headers={},
+            client=SimpleNamespace(host="10.0.0.1"),
+        )
+
+        payload = {
+            "model": "gpt-4",
+            "stream": True,
+            "messages": [{"role": "user", "content": "explain quantum computing"}],
+        }
+
+        session_key = app_module._extract_session_key(
+            request, payload, endpoint="/chat/completions"
+        )
+        self.assertIsNotNone(session_key)
+        self.assertTrue(session_key.startswith("content|"))
+
     async def test_reload_auto_model_discovery_does_not_block_event_loop(self) -> None:
         self.config_path.write_text(
             yaml.safe_dump(
