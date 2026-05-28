@@ -564,6 +564,7 @@ class RouterState:
         self.last_config_mtime: float | None = None
         self.last_observed_config_mtime: float | None = None
         self.last_reload_error: str | None = None
+        self._reload_lock = asyncio.Lock()
         self._apply_config(self._load_config())
 
     def _build_provider(
@@ -892,17 +893,18 @@ class RouterState:
         self.last_observed_config_mtime = config_mtime
 
     async def reload(self) -> ReloadResult:
-        try:
-            config = self._load_config()
-        except Exception as exc:
-            error = f"{exc.__class__.__name__}: {exc}"
-            async with self._lock:
-                self.last_reload_error = error
-            return ReloadResult(status="rejected", reloaded=False, error=error)
+        async with self._reload_lock:
+            try:
+                config = await asyncio.to_thread(self._load_config)
+            except Exception as exc:
+                error = f"{exc.__class__.__name__}: {exc}"
+                async with self._lock:
+                    self.last_reload_error = error
+                return ReloadResult(status="rejected", reloaded=False, error=error)
 
-        async with self._lock:
-            self._apply_config(config)
-        return ReloadResult(status="reloaded", reloaded=True)
+            async with self._lock:
+                self._apply_config(config)
+            return ReloadResult(status="reloaded", reloaded=True)
 
     async def reload_if_changed(self) -> ReloadResult:
         try:

@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import importlib
 import os
+import threading
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -113,6 +115,57 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "rejected")
         self.assertFalse(result.reloaded)
         self.assertEqual(models[0]["providers"][0]["api_base"], "https://one.example/v1")
+
+    async def test_reload_auto_model_discovery_does_not_block_event_loop(self) -> None:
+        self.config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "providers": [
+                        {
+                            "name": "auto",
+                            "api_base": "https://auto.example",
+                            "api_key": "sk-auto",
+                            "endpoint_type": "openai-compatible",
+                            "models": "auto",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        def fake_get(url: str, **kwargs: Any) -> httpx.Response:
+            entered.set()
+            release.wait(timeout=0.25)
+            return httpx.Response(
+                200,
+                json={"object": "list", "data": [{"id": "gpt-auto", "object": "model"}]},
+            )
+
+        original_get = app_module.httpx.get
+        app_module.httpx.get = fake_get
+        reload_task = asyncio.create_task(self.state.reload())
+        try:
+            start = time.perf_counter()
+            while not entered.is_set() and time.perf_counter() - start < 0.5:
+                await asyncio.sleep(0.005)
+
+            elapsed = time.perf_counter() - start
+            self.assertTrue(entered.is_set())
+            self.assertLess(elapsed, 0.1)
+            release.set()
+            result = await reload_task
+        finally:
+            release.set()
+            app_module.httpx.get = original_get
+            if not reload_task.done():
+                reload_task.cancel()
+
+        self.assertEqual(result.status, "reloaded")
+        models = await self.state.list_models()
+        self.assertEqual([model["id"] for model in models], ["gpt-auto"])
 
     async def test_reload_if_changed_ignores_unchanged_file(self) -> None:
         await asyncio.sleep(0)

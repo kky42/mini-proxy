@@ -140,7 +140,7 @@ use `models_url` only when model discovery is hosted somewhere different.
 
 `models: auto`
 
-When `models` is set to `auto`, the proxy loads model ids from the provider's models endpoint when the config is loaded or hot-reloaded.
+When `models` is set to `auto`, the proxy loads model ids from the provider's models endpoint when the config is loaded, manually reloaded, or hot-reloaded. Startup waits for discovery to finish. Manual reload and hot reload run discovery off the main event loop, so a slow models endpoint can delay the config update but does not freeze in-flight proxy requests.
 
 ```yaml
 providers:
