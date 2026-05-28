@@ -8,7 +8,7 @@ A small local proxy with:
 - in-memory cooldown after failure
 - automatic return to higher-priority providers after cooldown expires
 - OpenAI-compatible `responses` and `chat.completions` endpoints
-- Anthropic-compatible `messages` endpoint for Claude Code style clients
+- Anthropic-compatible `messages` and `messages/count_tokens` endpoints for Claude Code style clients
 
 It is designed to be a thin local layer, not a full gateway.
 
@@ -143,6 +143,8 @@ use `models_url` only when model discovery is hosted somewhere different.
 
 When `models` is set to `auto`, the proxy loads model ids from the provider's models endpoint when the config is loaded, manually reloaded, or hot-reloaded. Startup waits for discovery to finish. Manual reload and hot reload run discovery off the main event loop, so a slow models endpoint can delay the config update but does not freeze in-flight proxy requests.
 
+**Parallel Discovery**: When multiple providers use `models: auto`, the proxy fetches all model lists in parallel using `asyncio.gather()`, significantly reducing startup time compared to sequential requests.
+
 ```yaml
 providers:
   - name: songsong-anthropic
@@ -213,9 +215,11 @@ models:
 - `POST /v1/responses`
 - `POST /v1/chat/completions`
 - `POST /v1/messages`
+- `POST /v1/messages/count_tokens`
 - `POST /responses`
 - `POST /chat/completions`
 - `POST /messages`
+- `POST /messages/count_tokens`
 - `GET /v1/models`
 - `GET /models`
 - `GET /`
@@ -226,10 +230,10 @@ models:
 ## Behavior Notes
 
 - For a requested model, the proxy tries only providers whose `models` list includes that model, ordered by lowest `order` first.
-- `endpoint_type` restricts a provider to one local route family: `responses` for `/v1/responses`, `openai-compatible` for `/v1/chat/completions`, and `anthropic` for `/v1/messages`.
+- `endpoint_type` restricts a provider to one local route family: `responses` for `/v1/responses`, `openai-compatible` for `/v1/chat/completions`, and `anthropic` for `/v1/messages` plus `/v1/messages/count_tokens`.
 - Local OpenAI-style clients may use either `http://127.0.0.1:PORT/v1` or `http://127.0.0.1:PORT` as the base URL. Claude Code should use `http://127.0.0.1:PORT` as `ANTHROPIC_BASE_URL`.
 - Upstream provider bases may be configured with or without `/v1`; for example `https://ai.songsongcard.shop` plus `endpoint_type: responses` routes to `https://ai.songsongcard.shop/v1/responses`.
-- Upstream Anthropic provider bases should be the provider's documented Anthropic base, such as `https://api.deepseek.com/anthropic`; the proxy routes messages to `https://api.deepseek.com/anthropic/v1/messages`.
+- Upstream Anthropic provider bases should be the provider's documented Anthropic base, such as `https://api.deepseek.com/anthropic`; the proxy routes messages to `https://api.deepseek.com/anthropic/v1/messages` and token counts to `https://api.deepseek.com/anthropic/v1/messages/count_tokens`.
 - `api_url` bypasses URL inference and is used exactly as configured.
 - For `/v1/messages`, `:haiku`, `:sonnet`, and `:opus` model suffixes expose Claude Code-safe aliases: `claude-haiku-4-5-20251001`, `claude-sonnet-4-6`, and `claude-opus-4-7`.
 - If Claude Code sends a newer role model id that contains `haiku`, `sonnet`, or `opus`, the proxy can still route it to providers configured with the matching role suffix.

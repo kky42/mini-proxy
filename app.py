@@ -16,7 +16,7 @@ from typing import Any, AsyncIterator
 import httpx
 import yaml
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -33,6 +33,7 @@ ANTHROPIC_ROLE_MODEL_ALIASES = {
 }
 ANTHROPIC_ONE_M_SUFFIX_RE = re.compile(r"\[1m\]\s*$", re.IGNORECASE)
 ENDPOINT_TYPES = {"responses", "openai-compatible", "anthropic"}
+ANTHROPIC_ENDPOINTS = {"/messages", "/messages/count_tokens"}
 
 
 def _normalize_upstream_model(model_name: str) -> str:
@@ -174,7 +175,7 @@ def _endpoint_type_supports_endpoint(endpoint_type: str | None, endpoint: str) -
     if endpoint_type is None:
         return True
     if endpoint_type == "anthropic":
-        return endpoint == "/messages"
+        return endpoint in ANTHROPIC_ENDPOINTS
     if endpoint_type == "responses":
         return endpoint == "/responses" or endpoint == "/responses/compact"
     if endpoint_type == "openai-compatible":
@@ -575,6 +576,10 @@ def provider_debug_dict(provider: Provider) -> dict[str, Any]:
             "/responses": build_upstream_url(provider, "/responses"),
             "/chat/completions": build_upstream_url(provider, "/chat/completions"),
             "/messages": build_upstream_url(provider, "/messages"),
+            "/messages/count_tokens": build_upstream_url(
+                provider,
+                "/messages/count_tokens",
+            ),
         },
     }
 
@@ -630,7 +635,31 @@ class RouterState:
         self.last_observed_config_mtime: float | None = None
         self.last_reload_error: str | None = None
         self._reload_lock = asyncio.Lock()
-        self._apply_config(self._load_config())
+
+    async def initialize(self) -> None:
+        """Load initial config. Must be called after __init__."""
+        config = await self._load_config()
+        self._apply_config(config)
+
+    @classmethod
+    def create_sync(cls, config_path: str) -> "RouterState":
+        """Create and initialize RouterState synchronously (for startup)."""
+        instance = cls(config_path)
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(instance.initialize())
+            return instance
+
+        # Async test runners and embedded callers can already have a running
+        # loop. Initialize on a private loop in a short-lived thread.
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(lambda: asyncio.run(instance.initialize()))
+            future.result()
+        return instance
 
     def _build_provider(
         self,
@@ -751,7 +780,7 @@ class RouterState:
             raise ValueError("models auto discovery requires api_base or models_url")
         return _infer_models_url(api_base)
 
-    def _load_auto_models(
+    async def _load_auto_models(
         self,
         provider_params: dict[str, Any],
         *,
@@ -765,11 +794,12 @@ class RouterState:
         else:
             headers["Authorization"] = f"Bearer {provider_params['api_key']}"
 
-        response = httpx.get(
-            self._models_url(provider_params),
-            headers=headers,
-            timeout=_coerce_optional_timeout(provider_params.get("timeout")) or DEFAULT_TIMEOUT,
-        )
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                self._models_url(provider_params),
+                headers=headers,
+                timeout=_coerce_optional_timeout(provider_params.get("timeout")) or DEFAULT_TIMEOUT,
+            )
         if response.status_code >= 400:
             raise ValueError(
                 f"providers[{provider_index}].models auto discovery failed with "
@@ -838,7 +868,7 @@ class RouterState:
             warnings=tuple(warnings),
         )
 
-    def _load_providers(
+    async def _load_providers(
         self,
         raw: dict[str, Any],
         *,
@@ -851,8 +881,11 @@ class RouterState:
         if not isinstance(providers_config, list):
             raise ValueError("providers must be a list")
 
-        grouped: dict[str, list[Provider]] = {}
+        # First pass: validate all providers and collect auto-discovery tasks
+        validated_providers: list[tuple[int, dict[str, Any], str, str | None]] = []
+        auto_discovery_tasks: list[tuple[int, dict[str, Any], str | None]] = []
         seen_provider_names: set[str] = set()
+
         for provider_index, provider_params in enumerate(providers_config):
             if not isinstance(provider_params, dict):
                 raise ValueError(f"providers[{provider_index}] must be a mapping")
@@ -889,22 +922,43 @@ class RouterState:
                     f"providers[{provider_index}].endpoint_type is required when "
                     "api_url is set"
                 )
+
+            models = provider_params.get("models")
+            if isinstance(models, str) and models.strip().lower() == "auto":
+                auto_discovery_tasks.append((provider_index, provider_params, endpoint_type))
+
+            validated_providers.append((provider_index, provider_params, provider_name, endpoint_type))
+
+        # Second pass: run all auto-discovery tasks in parallel
+        auto_discovery_results: dict[int, AutoModelDiscovery] = {}
+        if auto_discovery_tasks:
+            discovery_coros = [
+                self._load_auto_models(params, provider_index=idx, endpoint_type=ep_type)
+                for idx, params, ep_type in auto_discovery_tasks
+            ]
+            results = await asyncio.gather(*discovery_coros)
+            auto_discovery_results = {
+                auto_discovery_tasks[i][0]: result
+                for i, result in enumerate(results)
+            }
+
+        # Third pass: build provider objects
+        grouped: dict[str, list[Provider]] = {}
+        for provider_index, provider_params, provider_name, endpoint_type in validated_providers:
             models = provider_params.get("models")
             model_source = "explicit"
             discovered_model_ids: tuple[str, ...] = ()
             filtered_model_ids: tuple[str, ...] = ()
             discovery_warnings: tuple[str, ...] = ()
+
             if isinstance(models, str) and models.strip().lower() == "auto":
-                auto_discovery = self._load_auto_models(
-                    provider_params,
-                    provider_index=provider_index,
-                    endpoint_type=endpoint_type,
-                )
+                auto_discovery = auto_discovery_results[provider_index]
                 models = auto_discovery.models
                 model_source = "auto"
                 discovered_model_ids = auto_discovery.discovered_models
                 filtered_model_ids = auto_discovery.filtered_models
                 discovery_warnings = auto_discovery.warnings
+
             if not isinstance(models, list) or not models:
                 raise ValueError(
                     f"providers[{provider_index}].models must be a non-empty list or 'auto'"
@@ -937,7 +991,7 @@ class RouterState:
             for model, providers in grouped.items()
         }
 
-    def _load_config(self) -> RouterConfig:
+    async def _load_config(self) -> RouterConfig:
         with open(self.config_path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
         if not isinstance(raw, dict):
@@ -977,7 +1031,7 @@ class RouterState:
         allowed_fails = int(router_settings.get("allowed_fails", 0))
         cooldown_time = int(router_settings.get("cooldown_time", 300))
 
-        providers_by_model = self._load_providers(
+        providers_by_model = await self._load_providers(
             raw,
             normalize_upstream_model=normalize_upstream_model,
         )
@@ -1086,7 +1140,7 @@ class RouterState:
     async def reload(self) -> ReloadResult:
         async with self._reload_lock:
             try:
-                config = await asyncio.to_thread(self._load_config)
+                config = await self._load_config()
             except Exception as exc:
                 error = f"{exc.__class__.__name__}: {exc}"
                 async with self._lock:
@@ -1120,7 +1174,7 @@ class RouterState:
         model_name = _normalize_requested_model(model_name)
         async with self._lock:
             providers = list(self.providers_by_model.get(model_name, []))
-            if endpoint == "/messages":
+            if endpoint in ANTHROPIC_ENDPOINTS:
                 role = _infer_anthropic_role_from_model_name(model_name)
                 if role:
                     role_providers = [
@@ -1242,9 +1296,14 @@ class RouterState:
                     responses_key = build_failure_key(provider, "/responses")
                     chat_key = build_failure_key(provider, "/chat/completions")
                     messages_key = build_failure_key(provider, "/messages")
+                    count_tokens_key = build_failure_key(
+                        provider,
+                        "/messages/count_tokens",
+                    )
                     responses_cooldown = self.cooldown_until.get(responses_key)
                     chat_cooldown = self.cooldown_until.get(chat_key)
                     messages_cooldown = self.cooldown_until.get(messages_key)
+                    count_tokens_cooldown = self.cooldown_until.get(count_tokens_key)
                     providers.append(
                         {
                             "model_name": model_name,
@@ -1268,6 +1327,10 @@ class RouterState:
                                     "/chat/completions",
                                 ),
                                 "/messages": build_upstream_url(provider, "/messages"),
+                                "/messages/count_tokens": build_upstream_url(
+                                    provider,
+                                    "/messages/count_tokens",
+                                ),
                             },
                             "order": provider.order,
                             "timeout": provider.timeout,
@@ -1282,11 +1345,20 @@ class RouterState:
                                 "/messages": max(0, int(messages_cooldown - now))
                                 if messages_cooldown
                                 else 0,
+                                "/messages/count_tokens": max(
+                                    0,
+                                    int(count_tokens_cooldown - now),
+                                )
+                                if count_tokens_cooldown
+                                else 0,
                             },
                             "last_error": {
                                 "/responses": self.last_error.get(responses_key),
                                 "/chat/completions": self.last_error.get(chat_key),
                                 "/messages": self.last_error.get(messages_key),
+                                "/messages/count_tokens": self.last_error.get(
+                                    count_tokens_key,
+                                ),
                             },
                         }
                     )
@@ -1380,7 +1452,7 @@ if not CONFIG_PATH:
         "./start.sh --config /path/to/config.yaml"
     )
 
-router_state = RouterState(os.path.expanduser(CONFIG_PATH))
+router_state = RouterState.create_sync(os.path.expanduser(CONFIG_PATH))
 
 
 async def watch_config_changes() -> None:
@@ -1496,7 +1568,7 @@ def build_upstream_timeout(
 
 
 def build_upstream_headers(request: Request, provider: Provider, endpoint: str) -> dict[str, str]:
-    if endpoint == "/messages":
+    if endpoint in ANTHROPIC_ENDPOINTS:
         headers = {
             "x-api-key": provider.api_key,
             "anthropic-version": request.headers.get(
@@ -1906,12 +1978,18 @@ async def root() -> dict[str, Any]:
         "config_path": router_state.config_path,
         "endpoints": [
             "/v1/messages",
+            "/v1/messages/count_tokens",
             "/v1/responses",
             "/v1/chat/completions",
             "/healthz",
             "/debug/state",
         ],
     }
+
+
+@app.head("/")
+async def root_head() -> Response:
+    return Response(status_code=200)
 
 
 @app.get("/debug/state")
@@ -1974,9 +2052,19 @@ async def messages_api(request: Request) -> Any:
     return await forward_request(request, "/messages")
 
 
+@app.post("/v1/messages/count_tokens")
+async def messages_count_tokens_api(request: Request) -> Any:
+    return await forward_request(request, "/messages/count_tokens")
+
+
 @app.post("/messages")
 async def messages_api_root(request: Request) -> Any:
     return await forward_request(request, "/messages")
+
+
+@app.post("/messages/count_tokens")
+async def messages_count_tokens_api_root(request: Request) -> Any:
+    return await forward_request(request, "/messages/count_tokens")
 
 
 @app.get("/models")

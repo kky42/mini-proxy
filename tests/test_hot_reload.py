@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import importlib
 import os
-import threading
 import tempfile
 import time
 import unittest
+import contextlib
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -71,12 +72,34 @@ with tempfile.TemporaryDirectory() as import_config_dir:
     app_module = importlib.import_module("app")
 
 
+def install_fake_async_get(handler: Any) -> Any:
+    class FakeAsyncClient:
+        def __init__(self, **_: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, *_: Any) -> None:
+            pass
+
+        async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+            result = handler(url, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+
+    original_client = app_module.httpx.AsyncClient
+    app_module.httpx.AsyncClient = FakeAsyncClient
+    return original_client
+
+
 class HotReloadTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.config_path = Path(self.temp_dir.name) / "config.yaml"
         write_config(self.config_path, api_base="https://one.example/v1")
-        self.state = app_module.RouterState(str(self.config_path))
+        self.state = app_module.RouterState.create_sync(str(self.config_path))
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -173,19 +196,19 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             ),
             encoding="utf-8",
         )
-        entered = threading.Event()
-        release = threading.Event()
+        entered = asyncio.Event()
+        release = asyncio.Event()
 
-        def fake_get(url: str, **kwargs: Any) -> httpx.Response:
+        async def fake_get(url: str, **kwargs: Any) -> httpx.Response:
             entered.set()
-            release.wait(timeout=0.25)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(release.wait(), timeout=0.25)
             return httpx.Response(
                 200,
                 json={"object": "list", "data": [{"id": "gpt-auto", "object": "model"}]},
             )
 
-        original_get = app_module.httpx.get
-        app_module.httpx.get = fake_get
+        original_client = install_fake_async_get(fake_get)
         reload_task = asyncio.create_task(self.state.reload())
         try:
             start = time.perf_counter()
@@ -199,7 +222,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             result = await reload_task
         finally:
             release.set()
-            app_module.httpx.get = original_get
+            app_module.httpx.AsyncClient = original_client
             if not reload_task.done():
                 reload_task.cancel()
 
@@ -233,7 +256,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             api_base="https://one.example/v1",
             extra_providers=[("https://two.example/v1", 2)],
         )
-        self.state = app_module.RouterState(str(self.config_path))
+        self.state = app_module.RouterState.create_sync(str(self.config_path))
         providers = self.state.providers_by_model["gpt-test"]
         cooling_provider = providers[1]
         self.state.cooldown_until[
@@ -281,7 +304,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
         self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
-        self.state = app_module.RouterState(str(self.config_path))
+        self.state = app_module.RouterState.create_sync(str(self.config_path))
 
         gpt_a_candidates = await self.state.get_candidate_providers(
             "gpt-a",
@@ -324,7 +347,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "providers\\[0\\]\\.name is required"):
-            app_module.RouterState(str(self.config_path))
+            app_module.RouterState.create_sync(str(self.config_path))
 
         self.config_path.write_text(
             yaml.safe_dump(
@@ -352,7 +375,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             ValueError,
             "providers\\[1\\]\\.name must be unique: duplicate",
         ):
-            app_module.RouterState(str(self.config_path))
+            app_module.RouterState.create_sync(str(self.config_path))
 
     async def test_provider_name_is_provider_id_for_same_route_url(self) -> None:
         data: dict[str, Any] = {
@@ -374,7 +397,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
         self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
-        self.state = app_module.RouterState(str(self.config_path))
+        self.state = app_module.RouterState.create_sync(str(self.config_path))
 
         candidates = await self.state.get_candidate_providers(
             "gpt-test",
@@ -434,7 +457,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
 
         with self.assertLogs("uvicorn.error", level="INFO") as logs:
-            self.state = app_module.RouterState(str(self.config_path))
+            self.state = app_module.RouterState.create_sync(str(self.config_path))
 
         output = "\n".join(logs.output)
         self.assertIn("Loaded config: 1 providers, 2 model routes", output)
@@ -461,7 +484,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
         self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
-        self.state = app_module.RouterState(str(self.config_path))
+        self.state = app_module.RouterState.create_sync(str(self.config_path))
 
         candidates = await self.state.get_candidate_providers(
             "gpt-5.5",
@@ -509,12 +532,11 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
 
-        original_get = app_module.httpx.get
-        app_module.httpx.get = fake_get
+        original_client = install_fake_async_get(fake_get)
         try:
-            self.state = app_module.RouterState(str(self.config_path))
+            self.state = app_module.RouterState.create_sync(str(self.config_path))
         finally:
-            app_module.httpx.get = original_get
+            app_module.httpx.AsyncClient = original_client
 
         models = await self.state.list_models()
         candidates = await self.state.get_candidate_providers(
@@ -566,12 +588,11 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
 
-        original_get = app_module.httpx.get
-        app_module.httpx.get = fake_get
+        original_client = install_fake_async_get(fake_get)
         try:
-            self.state = app_module.RouterState(str(self.config_path))
+            self.state = app_module.RouterState.create_sync(str(self.config_path))
         finally:
-            app_module.httpx.get = original_get
+            app_module.httpx.AsyncClient = original_client
 
         models = await self.state.list_models()
         message_candidates = await self.state.get_candidate_providers(
@@ -626,13 +647,12 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
 
-        original_get = app_module.httpx.get
-        app_module.httpx.get = fake_get
+        original_client = install_fake_async_get(fake_get)
         try:
             with self.assertLogs("uvicorn.error", level="WARNING") as logs:
-                self.state = app_module.RouterState(str(self.config_path))
+                self.state = app_module.RouterState.create_sync(str(self.config_path))
         finally:
-            app_module.httpx.get = original_get
+            app_module.httpx.AsyncClient = original_client
 
         models = await self.state.list_models()
         candidates = await self.state.get_candidate_providers(
@@ -693,7 +713,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
         self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
-        self.state = app_module.RouterState(str(self.config_path))
+        self.state = app_module.RouterState.create_sync(str(self.config_path))
 
         opus_candidates = await self.state.get_candidate_providers(
             "claude-opus-4-7[1M]",
@@ -741,7 +761,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
         self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
-        self.state = app_module.RouterState(str(self.config_path))
+        self.state = app_module.RouterState.create_sync(str(self.config_path))
 
         candidates = await self.state.get_candidate_providers(
             "claude-opus-4-99",
@@ -902,12 +922,11 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
                 json={"object": "list", "data": [{"id": "gpt-auto", "object": "model"}]},
             )
 
-        original_get = app_module.httpx.get
-        app_module.httpx.get = fake_get
+        original_client = install_fake_async_get(fake_get)
         try:
-            self.state = app_module.RouterState(str(self.config_path))
+            self.state = app_module.RouterState.create_sync(str(self.config_path))
         finally:
-            app_module.httpx.get = original_get
+            app_module.httpx.AsyncClient = original_client
 
         candidates = await self.state.get_candidate_providers(
             "gpt-auto",
@@ -945,12 +964,11 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
                 json={"object": "list", "data": [{"id": "gpt-auto", "object": "model"}]},
             )
 
-        original_get = app_module.httpx.get
-        app_module.httpx.get = fake_get
+        original_client = install_fake_async_get(fake_get)
         try:
-            self.state = app_module.RouterState(str(self.config_path))
+            self.state = app_module.RouterState.create_sync(str(self.config_path))
         finally:
-            app_module.httpx.get = original_get
+            app_module.httpx.AsyncClient = original_client
 
         self.assertEqual(captured[0]["url"], "https://custom.example/list-models/")
 
@@ -977,7 +995,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             ValueError,
             "models auto discovery requires api_base or models_url",
         ):
-            app_module.RouterState(str(self.config_path))
+            app_module.RouterState.create_sync(str(self.config_path))
 
     async def test_api_url_requires_endpoint_type(self) -> None:
         self.config_path.write_text(
@@ -1001,7 +1019,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             ValueError,
             r"providers\[0\]\.endpoint_type is required when api_url is set",
         ):
-            app_module.RouterState(str(self.config_path))
+            app_module.RouterState.create_sync(str(self.config_path))
 
     async def test_anthropic_exact_model_and_role_suffix_share_candidates(self) -> None:
         data: dict[str, Any] = {
@@ -1025,7 +1043,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
         self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
-        self.state = app_module.RouterState(str(self.config_path))
+        self.state = app_module.RouterState.create_sync(str(self.config_path))
 
         candidates = await self.state.get_candidate_providers(
             "claude-opus-4-7",
@@ -1052,7 +1070,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             ],
         }
         self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
-        self.state = app_module.RouterState(str(self.config_path))
+        self.state = app_module.RouterState.create_sync(str(self.config_path))
 
         captured: list[dict[str, Any]] = []
 
@@ -1111,6 +1129,85 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured[0]["headers"]["anthropic-version"], "2023-06-01")
         self.assertNotIn("Authorization", captured[0]["headers"])
 
+    async def test_messages_count_tokens_endpoint_rewrites_alias_to_upstream_model(
+        self,
+    ) -> None:
+        data: dict[str, Any] = {
+            "app_settings": {"hot_reload": False},
+            "providers": [
+                {
+                    "name": "anthropic-compatible",
+                    "api_base": "https://anthropic.example/v1",
+                    "api_key": "sk-anthropic",
+                    "order": 1,
+                    "endpoint_type": "anthropic",
+                    "models": ["deepseek-v4-pro:opus"],
+                }
+            ],
+        }
+        self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        self.state = app_module.RouterState.create_sync(str(self.config_path))
+
+        captured: list[dict[str, Any]] = []
+
+        class FakeAsyncClient:
+            def __init__(self, **_: Any) -> None:
+                pass
+
+            async def post(
+                self,
+                url: str,
+                *,
+                headers: dict[str, str],
+                json: dict[str, Any],
+                timeout: Any,
+            ) -> httpx.Response:
+                captured.append(
+                    {
+                        "url": url,
+                        "headers": headers,
+                        "json": json,
+                        "timeout": timeout,
+                    }
+                )
+                return httpx.Response(
+                    200,
+                    json={"input_tokens": 42},
+                    headers={"content-type": "application/json"},
+                )
+
+            async def aclose(self) -> None:
+                pass
+
+        original_state = app_module.router_state
+        original_client = app_module.httpx.AsyncClient
+        app_module.router_state = self.state
+        app_module.httpx.AsyncClient = FakeAsyncClient
+        try:
+            client = TestClient(app_module.app)
+            response = client.post(
+                "/v1/messages/count_tokens?beta=true",
+                headers={"anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-opus-4-99[1M]",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+        finally:
+            app_module.router_state = original_state
+            app_module.httpx.AsyncClient = original_client
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"input_tokens": 42})
+        self.assertEqual(
+            captured[0]["url"],
+            "https://anthropic.example/v1/messages/count_tokens",
+        )
+        self.assertEqual(captured[0]["json"]["model"], "deepseek-v4-pro")
+        self.assertEqual(captured[0]["headers"]["x-api-key"], "sk-anthropic")
+        self.assertEqual(captured[0]["headers"]["anthropic-version"], "2023-06-01")
+        self.assertNotIn("Authorization", captured[0]["headers"])
+
     async def test_invalid_success_response_falls_back_to_next_provider(self) -> None:
         data: dict[str, Any] = {
             "app_settings": {"hot_reload": False},
@@ -1134,7 +1231,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             ],
         }
         self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
-        self.state = app_module.RouterState(str(self.config_path))
+        self.state = app_module.RouterState.create_sync(str(self.config_path))
 
         captured: list[dict[str, Any]] = []
 
@@ -1214,7 +1311,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             ],
         }
         self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
-        self.state = app_module.RouterState(str(self.config_path))
+        self.state = app_module.RouterState.create_sync(str(self.config_path))
         captured: list[dict[str, Any]] = []
 
         class FakeStreamResponse:
@@ -1357,7 +1454,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             ],
         }
         self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
-        self.state = app_module.RouterState(str(self.config_path))
+        self.state = app_module.RouterState.create_sync(str(self.config_path))
         captured: list[dict[str, Any]] = []
 
         class FakeStreamResponse:
@@ -1496,7 +1593,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             ],
         }
         self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
-        self.state = app_module.RouterState(str(self.config_path))
+        self.state = app_module.RouterState.create_sync(str(self.config_path))
         captured: list[dict[str, Any]] = []
 
         class FakeStreamResponse:
@@ -1604,7 +1701,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
             ],
         }
         self.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")
-        self.state = app_module.RouterState(str(self.config_path))
+        self.state = app_module.RouterState.create_sync(str(self.config_path))
 
         original_state = app_module.router_state
         app_module.router_state = self.state
@@ -1618,6 +1715,13 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(root_response.status_code, 200)
         self.assertEqual(root_response.json(), v1_response.json())
         self.assertEqual(root_response.json()["data"][0]["id"], "gpt-5.5")
+
+    async def test_root_head_returns_ok(self) -> None:
+        client = TestClient(app_module.app)
+        response = client.head("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"")
 
     async def test_legacy_model_list_is_rejected(self) -> None:
         self.config_path.write_text(
@@ -1639,7 +1743,7 @@ class HotReloadTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "model_list is no longer supported"):
-            app_module.RouterState(str(self.config_path))
+            app_module.RouterState.create_sync(str(self.config_path))
 
 
 if __name__ == "__main__":
