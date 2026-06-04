@@ -110,26 +110,117 @@ def build_upstream_timeout(
     return httpx.Timeout(timeout, read=None)
 
 
-def build_upstream_headers(request: Request, provider: Provider, endpoint: str) -> dict[str, str]:
-    if endpoint in ANTHROPIC_ENDPOINTS:
-        headers = {
-            "x-api-key": provider.api_key,
-            "anthropic-version": request.headers.get(
-                "anthropic-version",
-                ANTHROPIC_VERSION,
-            ),
-            "Content-Type": "application/json",
-        }
-        anthropic_beta = request.headers.get("anthropic-beta")
-        if anthropic_beta:
-            headers["anthropic-beta"] = anthropic_beta
-        return {**headers, **provider.extra_headers}
+# Headers that must NOT be forwarded to upstream (hop-by-hop, auth, or
+# headers that httpx sets automatically based on the request body/URL).
+_FORBIDDEN_UPSTREAM_HEADERS: set[str] = {
+    "host",
+    "content-length",
+    "content-type",
+    "transfer-encoding",
+    "connection",
+    "te",
+    "trailer",
+    "upgrade",
+    "keep-alive",
+    "authorization",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "x-api-key",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+}
 
+
+_RESPONSES_UPSTREAM_HEADER_NAMES: set[str] = {
+    "accept",
+    "originator",
+    "session-id",
+    "thread-id",
+    "user-agent",
+    "x-client-request-id",
+}
+_RESPONSES_UPSTREAM_HEADER_PREFIXES: tuple[str, ...] = ("x-codex-",)
+
+_ANTHROPIC_UPSTREAM_HEADER_NAMES: set[str] = {
+    "accept",
+    "anthropic-beta",
+    "anthropic-dangerous-direct-browser-access",
+    "anthropic-version",
+    "user-agent",
+    "x-app",
+    "x-claude-code-session-id",
+}
+_ANTHROPIC_UPSTREAM_HEADER_PREFIXES: tuple[str, ...] = ("x-stainless-",)
+
+_OPENAI_COMPAT_UPSTREAM_HEADER_NAMES: set[str] = {
+    "accept",
+    "user-agent",
+}
+
+
+def _connection_scoped_header_names(request: Request) -> set[str]:
+    connection = request.headers.get("connection")
+    if not connection:
+        return set()
     return {
-        "Authorization": f"Bearer {provider.api_key}",
-        "Content-Type": "application/json",
-        **provider.extra_headers,
+        header_name
+        for part in connection.split(",")
+        if (header_name := part.strip().lower())
     }
+
+
+def _is_allowed_client_header(header_name: str, endpoint: str) -> bool:
+    if endpoint == "/responses" or endpoint == "/responses/compact":
+        return (
+            header_name in _RESPONSES_UPSTREAM_HEADER_NAMES
+            or header_name.startswith(_RESPONSES_UPSTREAM_HEADER_PREFIXES)
+        )
+
+    if endpoint in ANTHROPIC_ENDPOINTS:
+        return (
+            header_name in _ANTHROPIC_UPSTREAM_HEADER_NAMES
+            or header_name.startswith(_ANTHROPIC_UPSTREAM_HEADER_PREFIXES)
+        )
+
+    return header_name in _OPENAI_COMPAT_UPSTREAM_HEADER_NAMES
+
+
+def _has_header(headers: dict[str, str], header_name: str) -> bool:
+    normalized = header_name.lower()
+    return any(key.lower() == normalized for key in headers)
+
+
+def build_upstream_headers(request: Request, provider: Provider, endpoint: str) -> dict[str, str]:
+    connection_scoped_headers = _connection_scoped_header_names(request)
+    headers: dict[str, str] = {}
+    for key, value in request.headers.items():
+        lower = key.lower()
+        if lower in _FORBIDDEN_UPSTREAM_HEADERS or lower in connection_scoped_headers:
+            continue
+        if not _is_allowed_client_header(lower, endpoint):
+            continue
+        headers[key] = value
+
+    # Provider auth
+    if endpoint in ANTHROPIC_ENDPOINTS:
+        headers["x-api-key"] = provider.api_key
+    else:
+        headers["Authorization"] = f"Bearer {provider.api_key}"
+
+    # Override content-type (always JSON)
+    headers["Content-Type"] = "application/json"
+
+    # Anthropic-specific: ensure version header, relay beta
+    if endpoint in ANTHROPIC_ENDPOINTS:
+        if not _has_header(headers, "anthropic-version"):
+            headers["anthropic-version"] = ANTHROPIC_VERSION
+
+    # Merge provider extra_headers (may override client headers)
+    headers.update(provider.extra_headers)
+
+    return headers
 
 
 def is_valid_stream_success_content_type(content_type: str) -> bool:
