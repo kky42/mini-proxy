@@ -94,11 +94,12 @@ class FallbackTests(E2EBase):
                 "messages": [{"role": "user", "content": "Hello"}],
             })
             self.assertEqual(r.status_code, 503)
-            # FastAPI wraps HTTPException detail under "detail" key
-            detail = r.json()["detail"]
-            self.assertEqual(detail["message"], "All providers failed")
-            self.assertEqual(detail["candidate_provider_count"], 2)
-            self.assertEqual(detail["attempted_provider_count"], 2)
+            body = r.json()
+            self.assertIn("error", body)
+            self.assertEqual(body["error"]["message"], "All providers failed for model 'gpt-4'")
+            self.assertEqual(body["error"]["code"], "service_unavailable")
+            self.assertEqual(body["candidate_provider_count"], 2)
+            self.assertEqual(body["attempted_provider_count"], 2)
         finally:
             self.restore_state_and_client(orig_client, orig_state)
 

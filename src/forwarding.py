@@ -404,7 +404,16 @@ async def forward_request(request: Request, endpoint: str) -> Any:
                     )
                     if decision.should_fallback:
                         break
-                    raise HTTPException(status_code=503, detail={"message": error_message})
+                    return JSONResponse(
+                        content={
+                            "error": {
+                                "message": error_message,
+                                "type": "server_error",
+                                "code": "service_unavailable",
+                            },
+                        },
+                        status_code=503,
+                    )
 
                 if response.status_code >= 400:
                     body = await response.aread()
@@ -639,15 +648,19 @@ async def forward_request(request: Request, endpoint: str) -> Any:
             # Exhausted this provider or hit a non-retryable fallback case.
             continue
 
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "message": "All providers failed",
+        return JSONResponse(
+            content={
+                "error": {
+                    "message": f"All providers failed for model '{model_name}'",
+                    "type": "server_error",
+                    "code": "service_unavailable",
+                },
                 "model": model_name,
                 "candidate_provider_count": total_provider_count,
                 "attempted_provider_count": len(attempts),
                 "attempts": attempts,
             },
+            status_code=503,
         )
     finally:
         if not streaming_response:
