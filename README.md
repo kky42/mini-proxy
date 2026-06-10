@@ -137,6 +137,13 @@ providers:
 - `models`: non-empty list of models this provider supports, or `auto`.
 - `models_url`: optional exact URL for `models: auto` discovery.
 
+For pi-agent with OpenAI Responses / Codex relay upstream providers, set:
+
+```yaml
+headers:
+  User-Agent: curl/8.7.1
+```
+
 Most providers only need `api_base`, `api_key`, `endpoint_type`, `order`, and
 `models`. Use `api_url` only for providers with a nonstandard request URL, and
 use `models_url` only when model discovery is hosted somewhere different.
